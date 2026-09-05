@@ -18,7 +18,7 @@ def main() -> int:
     parser.add_argument("--report", default=None, help="quality report JSON output")
     parser.add_argument(
         "--primary",
-        default="price_mid_gbp_mwh",
+        default="price_apx",
         help="price column to gate usability on",
     )
     parser.add_argument("--max-interp", type=int, default=2, help="max gap filled, periods")

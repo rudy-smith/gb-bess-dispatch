@@ -14,7 +14,7 @@ from src.prep.clean import (
     stuck_mask,
 )
 
-PRICE_COL = "price_mid_gbp_mwh"
+PRICE_COL = "price_apx"
 
 
 def _frame(prices, start="2024-10-01 00:00", freq="30min"):

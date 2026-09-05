@@ -33,8 +33,8 @@ DEFAULT_PRICE_BOUNDS: tuple[float, float] = (-1000.0, 6000.0)
 class CleaningPolicy:
     """Configuration for the cleaning pass. Frozen so a run cannot mutate it."""
 
-    price_columns: Sequence[str] = ("price_mid_gbp_mwh", "price_apx", "price_n2ex")
-    primary_price_column: str = "price_mid_gbp_mwh"
+    price_columns: Sequence[str] = ("price_apx", "price_n2ex", "price_mid_gbp_mwh")
+    primary_price_column: str = "price_apx"
     price_bounds: tuple[float, float] = DEFAULT_PRICE_BOUNDS
     max_interp_periods: int = 2       # gaps of <= 1 hour are filled
     stuck_run_length: int = 6         # >= 3 hours of an identical price is a feed fault
@@ -156,6 +156,22 @@ def interpolate_short_gaps(
 # Main entry point
 # --------------------------------------------------------------------------- #
 
+
+def zeros_to_missing(series: pd.Series, min_run: int = 12) -> pd.Series:
+    """Convert zeros to NaN where they form long runs, leaving isolated zeros alone.
+
+    A price of exactly zero is legal in a market that prices negatively, so a
+    blanket conversion would destroy real observations. A run of many identical
+    zeros is instead the signature of a feed encoding absence as a value. The
+    run-length test distinguishes the two without assuming which columns are
+    affected.
+    """
+    is_zero = series.eq(0.0)
+    run_id = is_zero.ne(is_zero.shift()).cumsum()
+    run_size = is_zero.groupby(run_id).transform("size")
+    return series.mask(is_zero & (run_size >= min_run))
+
+
 def clean_prices(
     df: pd.DataFrame, policy: CleaningPolicy | None = None
 ) -> tuple[pd.DataFrame, QualityReport]:
@@ -213,7 +229,7 @@ def clean_prices(
         present_cols.append(policy.primary_price_column)   
 
     for col in present_cols:
-        series = out[col].astype(float)
+        series = zeros_to_missing(out[col].astype(float))
         report.missing_by_column[col] = int(series.isna().sum())
 
         oob = out_of_band_mask(series, policy.price_bounds)
@@ -294,3 +310,6 @@ def _flag_days(
         for d in observed.index[~complete]
     }
     return df
+
+
+
