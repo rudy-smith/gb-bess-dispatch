@@ -81,7 +81,12 @@ def get_solver(msg: bool = False, time_limit: int | None = None) -> pulp.LpSolve
             solver = factory()
             if solver.available():
                 return solver
-        except Exception:  # noqa: BLE001 - probing for an optional backend
+        except Exception as exc:  # noqa: BLE001 - probing for an optional backend
+            # A backend that is not installed raises on construction. That is an
+            # expected outcome of probing, but it is logged rather than discarded:
+            # a silent fall-through to CBC changes solve times by an order of
+            # magnitude and would otherwise be invisible in a long sweep.
+            LOGGER.debug("solver backend unavailable: %s", exc)
             continue
     raise RuntimeError("no MILP solver available; install highspy or use CBC")
 

@@ -1,80 +1,92 @@
 """Unit tests for the cleaning policy."""
-
+ 
 import numpy as np
 import pandas as pd
 import pytest
-
+ 
 from src.prep.clean import (
-    CleaningPolicy,
     clean_prices,
+    defaulted_price_mask,
     expected_periods,
     gap_lengths,
     interpolate_short_gaps,
+    liquidity_anomaly_mask,
     out_of_band_mask,
     stuck_mask,
+    zeros_to_missing,
 )
-
+ 
 PRICE_COL = "price_apx"
-
-
+VOLUME_COL = "volume_apx"
+ 
+# Comfortably above the 25 MWh Individual Liquidity Threshold, so a zero price
+# accompanied by this volume is a traded zero rather than a defaulted one.
+LIQUID_VOLUME = 1200.0
+ 
+ 
 def _frame(prices, start="2024-10-01 00:00", freq="30min"):
     idx = pd.date_range(start, periods=len(prices), freq=freq, tz="UTC")
     return pd.DataFrame({PRICE_COL: prices}, index=idx)
-
-
+ 
+ 
+def _frame_with_volume(prices, volumes, start="2024-10-01 00:00"):
+    idx = pd.date_range(start, periods=len(prices), freq="30min", tz="UTC")
+    return pd.DataFrame({PRICE_COL: prices, VOLUME_COL: volumes}, index=idx)
+ 
+ 
 def test_expected_periods_normal_day():
     assert expected_periods("2024-06-15") == 48
-
-
+ 
+ 
 def test_expected_periods_spring_forward():
     assert expected_periods("2024-03-31") == 46
-
-
+ 
+ 
 def test_expected_periods_autumn_back():
     assert expected_periods("2024-10-27") == 50
-
-
+ 
+ 
 def test_gap_lengths_counts_runs():
     s = pd.Series([1.0, np.nan, np.nan, 4.0, np.nan, 6.0])
     assert list(gap_lengths(s)) == [0, 2, 2, 0, 1, 0]
-
-
+ 
+ 
 def test_short_gap_is_filled_long_gap_is_not():
     prices = [10.0, np.nan, 30.0, 40.0, np.nan, np.nan, np.nan, 80.0]
-    s = _frame(prices)[PRICE_COL    ]
+    s = _frame(prices)[PRICE_COL]
     filled, mask = interpolate_short_gaps(s, max_gap=2)
     assert mask.sum() == 1
     assert filled.iloc[1] == pytest.approx(20.0)
     assert filled.iloc[4:7].isna().all()
-
-
+ 
+ 
 def test_leading_gap_is_never_extrapolated():
     s = _frame([np.nan, 20.0, 30.0])[PRICE_COL]
     filled, mask = interpolate_short_gaps(s, max_gap=2)
     assert not mask.any()
     assert np.isnan(filled.iloc[0])
-
-
+ 
+ 
 def test_out_of_band_flags_only_extremes():
     s = pd.Series([-9.74, 605.17, 9999.0, -5000.0])
     mask = out_of_band_mask(s, (-1000.0, 6000.0))
     assert list(mask) == [False, False, True, True]
-
-
+ 
+ 
 def test_stuck_mask_needs_a_long_run():
     s = pd.Series([50.0] * 6 + [51.0, 52.0])
     mask = stuck_mask(s, min_run=6)
     assert mask.iloc[:6].all()
     assert not mask.iloc[6:].any()
-
-
+ 
+ 
 def test_negative_prices_survive_cleaning():
     """Negative prices are market behaviour and must not be clipped away."""
     df = _frame([-20.0, 50.0, 120.0, -5.0] * 12)
     clean, _ = clean_prices(df)
     assert (clean[PRICE_COL] < 0).sum() == 24
-
-
+ 
+ 
 def test_reindex_inserts_missing_periods():
     idx = pd.to_datetime(
         ["2024-10-01 00:00", "2024-10-01 00:30", "2024-10-01 02:00"], utc=True
@@ -83,8 +95,8 @@ def test_reindex_inserts_missing_periods():
     clean, report = clean_prices(df)
     assert report.grid_rows_inserted == 2
     assert len(clean) == 5
-
-
+ 
+ 
 def test_inserted_rows_get_local_time_and_labels():
     """Rows created by the reindex must be labelled, not left as NaT."""
     idx = pd.to_datetime(
@@ -100,8 +112,8 @@ def test_inserted_rows_get_local_time_and_labels():
     clean, _ = clean_prices(df)
     assert clean["start_time_local"].notna().all()
     assert clean["settlement_period"].tolist() == [3, 4, 5, 6, 7]
-
-
+ 
+ 
 def test_duplicate_timestamps_dropped():
     idx = pd.to_datetime(
         ["2024-10-01 00:00", "2024-10-01 00:00", "2024-10-01 00:30"], utc=True
@@ -109,17 +121,17 @@ def test_duplicate_timestamps_dropped():
     df = pd.DataFrame({PRICE_COL: [10.0, 10.0, 20.0]}, index=idx)
     _, report = clean_prices(df)
     assert report.duplicate_rows_dropped == 1
-
-
+ 
+ 
 def test_clock_change_day_is_complete_at_50_periods():
     idx = pd.date_range("2024-10-26 23:00", periods=50, freq="30min", tz="UTC")
     df = pd.DataFrame({PRICE_COL: np.linspace(20, 120, 50)}, index=idx)
-    clean, report = clean_prices(df)
+    clean, _ = clean_prices(df)
     day = clean[clean["settlement_date"] == pd.Timestamp("2024-10-27")]
     assert len(day) == 50
     assert day["day_complete"].all()
-
-
+ 
+ 
 def test_incomplete_day_is_flagged_not_dropped():
     idx = pd.date_range("2024-06-15 00:00", periods=40, freq="30min", tz="UTC")
     df = pd.DataFrame({PRICE_COL: np.linspace(20, 120, 40)}, index=idx)
@@ -127,3 +139,67 @@ def test_incomplete_day_is_flagged_not_dropped():
     assert report.days_incomplete >= 1
     assert not clean["day_complete"].iloc[0]
     assert len(clean) == 40  # nothing deleted
+ 
+ 
+# --------------------------------------------------------------------------- #
+# Liquidity-defaulted prices
+#
+# The Market Index Definition Statement defaults both price and volume to zero
+# when qualifying traded volume falls below the Individual Liquidity Threshold.
+# These tests pin the resulting distinction: a zero price is data or an absence
+# of data depending on the volume beside it, never on the price alone.
+# --------------------------------------------------------------------------- #
+ 
+ 
+def test_defaulted_zero_is_identified_by_volume():
+    price = pd.Series([50.0, 0.0, 60.0])
+    volume = pd.Series([LIQUID_VOLUME, 0.0, LIQUID_VOLUME])
+    assert list(defaulted_price_mask(price, volume)) == [False, True, False]
+ 
+ 
+def test_traded_zero_survives_when_volume_is_present():
+    """A real GBP 0.00 clear is a market outcome and must not be deleted."""
+    price = pd.Series([50.0, 0.0, 60.0])
+    volume = pd.Series([LIQUID_VOLUME, LIQUID_VOLUME, LIQUID_VOLUME])
+    assert not defaulted_price_mask(price, volume).any()
+ 
+ 
+def test_volume_test_catches_what_the_run_length_test_cannot():
+    """An isolated defaulted period is invisible to a run-length heuristic.
+ 
+    This is the case that matters: a lone zero surrounded by ordinary prices is
+    the one a perfect-foresight optimiser is most likely to select as a charging
+    period, and it is exactly the case the shape-based test misses.
+    """
+    price = pd.Series([50.0, 0.0, 60.0])
+    volume = pd.Series([LIQUID_VOLUME, 0.0, LIQUID_VOLUME])
+    assert defaulted_price_mask(price, volume).sum() == 1
+    assert zeros_to_missing(price, min_run=12).notna().all()
+ 
+ 
+def test_liquidity_anomaly_flags_the_combination_the_rule_forbids():
+    price = pd.Series([50.0, 0.0, 60.0])
+    volume = pd.Series([10.0, 0.0, LIQUID_VOLUME])
+    assert list(liquidity_anomaly_mask(price, volume)) == [True, False, False]
+ 
+ 
+def test_cleaning_replaces_a_defaulted_zero_rather_than_trading_it():
+    prices = [50.0, 0.0, 60.0] + [55.0] * 45
+    volumes = [LIQUID_VOLUME, 0.0] + [LIQUID_VOLUME] * 46
+    clean, report = clean_prices(_frame_with_volume(prices, volumes))
+ 
+    assert report.defaulted_by_column[PRICE_COL] == 1
+    assert report.liquidity_test_applied[PRICE_COL] is True
+    assert clean[f"{PRICE_COL}_defaulted"].iloc[1]
+    # Masked, then filled from its neighbours by the existing short-gap rule.
+    assert clean[PRICE_COL].iloc[1] == pytest.approx(55.0)
+    assert clean[f"{PRICE_COL}_interpolated"].iloc[1]
+ 
+ 
+def test_cleaning_falls_back_to_run_length_without_a_volume_column():
+    clean, report = clean_prices(_frame([50.0, 0.0, 60.0] + [55.0] * 45))
+    assert report.liquidity_test_applied[PRICE_COL] is False
+    # The isolated zero is left in place, which is the documented limitation of
+    # the fallback rather than a defect in it.
+    assert clean[PRICE_COL].iloc[1] == pytest.approx(0.0)
+    

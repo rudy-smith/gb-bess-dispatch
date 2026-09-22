@@ -126,7 +126,7 @@ def _fetch_month_raw(
     Request window and cache granularity are deliberately decoupled. The API
     limits how wide a single query may be, but caching per calendar month keeps
     cache keys readable and the file count manageable. Coupling the two would
-    mean either a cache file per week, or invalidating the whole cache whenever
+    mean either a cache file per seven days, or invalidating the whole cache whenever
     the server-side limit changed.
  
     Month boundaries are built in LOCAL time and then converted to UTC so the

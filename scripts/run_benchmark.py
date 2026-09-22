@@ -96,8 +96,10 @@ def summarise(daily: pd.DataFrame, spec: BatterySpec) -> str:
             f"daily revenue mean     GBP {daily['net_revenue_gbp'].mean():,.2f}",
             f"daily revenue median   GBP {daily['net_revenue_gbp'].median():,.2f}",
             f"daily revenue p90      GBP {daily['net_revenue_gbp'].quantile(0.90):,.2f}",
-            f"best day               GBP {daily['net_revenue_gbp'].max():,.2f} "
-            f"({daily['net_revenue_gbp'].idxmax().date()})",
+            (
+                f"best day               GBP {daily['net_revenue_gbp'].max():,.2f} "
+                f"({daily['net_revenue_gbp'].idxmax().date()})"
+            ),
             f"zero-revenue days      {int((daily['net_revenue_gbp'] <= 1e-6).sum())}",
         ]
     )
