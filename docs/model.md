@@ -288,6 +288,8 @@ than pretending the battery trades on one exchange. The data contradicted it:
 Correlation between the two series is −0.02, and the mean difference is −£81.93, which is
 approximately the negated APX mean, the signature of one series being near-constant at zero.
 
+![Reported volumes by provider, October 2024](../reports/figures/provider_volumes.png)
+
 The full-period default rate is the strongest evidence, and it was reached independently of the
 rulebook. Elexon's own MIDS review reports Nord Pool defaulting roughly 99.3% of settlement
 periods over its review year; this sample gives 99.56% over a different two-year window. A
