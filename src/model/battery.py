@@ -1,13 +1,13 @@
 """Physical model of a grid-scale lithium-ion battery energy storage system.
-
+ 
 The module owns two things: the specification of the asset, and an independent
 simulator that replays a dispatch schedule to recompute state of charge and
 revenue. The simulator exists to check the optimiser rather than to replace it,
 so it deliberately shares no code with the solver: an error common to both would
 otherwise cancel out and pass validation.
-
+ 
 Sign and measurement conventions, fixed here and used everywhere downstream:
-
+ 
   * Power is measured in MW at the grid connection point, not at the cell
     terminals. Charging is import, discharging is export. Money changes hands at
     the meter, so the traded quantity and the settled quantity are the same
@@ -17,20 +17,20 @@ Sign and measurement conventions, fixed here and used everywhere downstream:
     signed variable, because the efficiency losses differ in direction and a
     single signed variable cannot carry both.
 """
-
+ 
 from __future__ import annotations
-
+ 
 import math
 from dataclasses import dataclass
-
+ 
 import numpy as np
 import pandas as pd
-
-
+ 
+ 
 @dataclass(frozen=True)
 class BatterySpec:
     """Physical specification of the asset.
-
+ 
     Attributes
     ----------
     power_mw:
@@ -54,7 +54,7 @@ class BatterySpec:
         State of charge required at the end of the horizon. None leaves it
         free.
     """
-
+ 
     power_mw: float = 1.0
     duration_h: float = 2.0
     round_trip_efficiency: float = 0.90
@@ -62,7 +62,7 @@ class BatterySpec:
     soc_max_frac: float = 1.0
     initial_soc_frac: float = 0.5
     terminal_soc_frac: float | None = 0.5
-
+ 
     def __post_init__(self) -> None:
         if self.power_mw <= 0:
             raise ValueError("power_mw must be positive")
@@ -76,40 +76,40 @@ class BatterySpec:
             value = getattr(self, name)
             if value is not None and not self.soc_min_frac <= value <= self.soc_max_frac:
                 raise ValueError(f"{name}={value} lies outside the usable SoC window")
-
+ 
     # --- derived quantities ------------------------------------------------ #
-
+ 
     @property
     def energy_mwh(self) -> float:
         """Nameplate energy capacity."""
         return self.power_mw * self.duration_h
-
+ 
     @property
     def soc_min_mwh(self) -> float:
         return self.soc_min_frac * self.energy_mwh
-
+ 
     @property
     def soc_max_mwh(self) -> float:
         return self.soc_max_frac * self.energy_mwh
-
+ 
     @property
     def usable_energy_mwh(self) -> float:
         return self.soc_max_mwh - self.soc_min_mwh
-
+ 
     @property
     def initial_soc_mwh(self) -> float:
         return self.initial_soc_frac * self.energy_mwh
-
+ 
     @property
     def terminal_soc_mwh(self) -> float | None:
         if self.terminal_soc_frac is None:
             return None
         return self.terminal_soc_frac * self.energy_mwh
-
+ 
     @property
     def charge_efficiency(self) -> float:
         """One-way charging efficiency.
-
+ 
         The round-trip loss is split symmetrically between the two legs, so
         each one-way efficiency is the square root of the round trip. The split
         is a modelling convention, not a measurement: only the product is
@@ -118,19 +118,28 @@ class BatterySpec:
         the buy and the sell without changing the round trip.
         """
         return math.sqrt(self.round_trip_efficiency)
-
+ 
     @property
     def discharge_efficiency(self) -> float:
         return math.sqrt(self.round_trip_efficiency)
-
+ 
     def describe(self) -> str:
         return (
             f"{self.power_mw:g} MW / {self.energy_mwh:g} MWh "
             f"({self.duration_h:g} h), round trip {self.round_trip_efficiency:.0%}, "
             f"usable SoC {self.soc_min_frac:.0%}-{self.soc_max_frac:.0%}"
         )
-
-
+ 
+ 
+# Absolute tolerance for physical constraint checks, in MW or MWh.
+# A MILP solver satisfies constraints to its own feasibility tolerance, not
+# exactly, so a solved schedule can sit a few parts in 10^9 outside a bound
+# without anything being wrong. The value is looser than any solver's default
+# primal tolerance and far tighter than a physically meaningful quantity, and
+# it is defined once here so tests cannot silently adopt a stricter one and
+# become dependent on which solver happens to be installed.
+FEASIBILITY_TOL: float = 1e-6
+ 
 def simulate_schedule(
     spec: BatterySpec,
     charge_mw: np.ndarray | pd.Series,
@@ -140,15 +149,15 @@ def simulate_schedule(
     degradation_cost_gbp_per_mwh: float = 0.0,
 ) -> dict[str, object]:
     """Replay a dispatch schedule and recompute state of charge and revenue.
-
+ 
     Written independently of the optimiser so that agreement between the two is
     evidence rather than tautology. Returns the per-period trace and the
     aggregate figures.
-
+ 
     State of charge evolves as
-
+ 
         soc[t] = soc[t-1] + eta_c * charge[t] * dt - discharge[t] * dt / eta_d
-
+ 
     Charging loses energy on the way in, so less arrives than was imported.
     Discharging loses energy on the way out, so more must be drawn from storage
     than reaches the meter — hence division rather than multiplication.
@@ -158,22 +167,22 @@ def simulate_schedule(
     price = np.asarray(prices, dtype=float)
     if not (len(charge) == len(discharge) == len(price)):
         raise ValueError("charge, discharge and prices must have equal length")
-
+ 
     eta_c = spec.charge_efficiency
     eta_d = spec.discharge_efficiency
-
+ 
     soc = np.empty(len(price), dtype=float)
     level = spec.initial_soc_mwh
     for t in range(len(price)):
         level += eta_c * charge[t] * dt_hours - discharge[t] * dt_hours / eta_d
         soc[t] = level
-
+ 
     export_mwh = discharge * dt_hours
     import_mwh = charge * dt_hours
     gross_revenue = float(np.sum(price * (export_mwh - import_mwh)))
     throughput_mwh = float(np.sum(export_mwh))
     degradation_cost = degradation_cost_gbp_per_mwh * throughput_mwh
-
+ 
     trace = pd.DataFrame(
         {
             "price_gbp_mwh": price,
@@ -187,7 +196,7 @@ def simulate_schedule(
     )
     if isinstance(prices, pd.Series):
         trace.index = prices.index
-
+ 
     return {
         "trace": trace,
         "gross_revenue_gbp": gross_revenue,
@@ -197,40 +206,41 @@ def simulate_schedule(
         "equivalent_full_cycles": throughput_mwh / spec.usable_energy_mwh,
         "final_soc_mwh": float(soc[-1]) if len(soc) else spec.initial_soc_mwh,
     }
-
-
+ 
+ 
 def check_feasibility(
     spec: BatterySpec,
     result: dict[str, object],
     dt_hours: float = 0.5,
-    tol: float = 1e-6,
+    tol: float = FEASIBILITY_TOL,
 ) -> list[str]:
     """Return a list of physical constraint violations; empty means feasible.
-
+ 
     Returning violations rather than raising lets a caller report every problem
     at once instead of only the first.
     """
     trace: pd.DataFrame = result["trace"]  # type: ignore[assignment]
     problems: list[str] = []
-
+ 
     if (trace["charge_mw"] < -tol).any() or (trace["discharge_mw"] < -tol).any():
         problems.append("negative power in schedule")
     if (trace["charge_mw"] > spec.power_mw + tol).any():
         problems.append("charge power exceeds rating")
     if (trace["discharge_mw"] > spec.power_mw + tol).any():
         problems.append("discharge power exceeds rating")
-
+ 
     simultaneous = (trace["charge_mw"] > tol) & (trace["discharge_mw"] > tol)
     if simultaneous.any():
         problems.append(f"simultaneous charge and discharge in {int(simultaneous.sum())} periods")
-
+ 
     if (trace["soc_mwh"] < spec.soc_min_mwh - tol).any():
         problems.append("state of charge below lower bound")
     if (trace["soc_mwh"] > spec.soc_max_mwh + tol).any():
         problems.append("state of charge above upper bound")
-
+ 
     terminal = spec.terminal_soc_mwh
     if terminal is not None and abs(float(trace["soc_mwh"].iloc[-1]) - terminal) > 1e-4:
         problems.append("terminal state of charge not met")
-
+ 
     return problems
+ 
