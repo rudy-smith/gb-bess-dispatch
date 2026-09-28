@@ -8,7 +8,7 @@ solved schedule against an independent replay engine that shares no code with th
 
 Supporting it is a full data pipeline: GB settlement-period handling across clock changes,
 detection of liquidity-defaulted prices against the BSC rulebook, daily optimisation with the
-HiGHS solver, and a 49-test suite covering constraints and analytically checkable cases.
+HiGHS solver, and a 107-test suite covering constraints and analytically checkable cases.
 
 ## Key result
 
@@ -34,7 +34,14 @@ which is the trade-off between battery lifetime and arbitrage profit made explic
 - **Threshold baseline**: a trailing-percentile rule the optimiser must beat
 - **Degradation sweep and sensitivity analysis**: 24 full-period runs across degradation cost,
   duration and round-trip efficiency
-- **49 tests** covering the calendar, cleaner, battery constraints and degenerate cases
+- **NESO forecast client**: day-ahead wind and demand forecasts with publication-time
+  (vintage) handling, so a forecast is only used after it was published
+- **Elexon FUELHH client**: half-hourly generation outturn by fuel type, with a data fault in
+  Elexon's timestamps found and corrected (see below)
+- **Wind forecast audit**: a seasonal-control test for whether a block of archived forecasts
+  was regenerated with hindsight
+- **107 tests** covering the calendar, cleaner, battery constraints, degenerate cases, the
+  data clients and the audit statistics
 
 ## Results
 
@@ -162,7 +169,7 @@ cannot cancel out and pass.
 - The parameter sweep and the direct benchmark solve agree to the pound on the shared cell
 
 ```powershell
-python -m pytest tests/ -q     # 49 passed
+python -m pytest tests/ -q     # 107 passed
 ```
 
 ### What validation caught
@@ -177,6 +184,14 @@ so a spurious £0.00 is close to certain to be chosen as a charging period, and 
 error is one-sided rather than noisy. The largest single contributor, 2023-01-28, had earned
 £460.33 and ranked **7th of 729 days**, inside the top 1% of two years of trading, placed there
 by seven prices that were never traded at.
+
+Elexon's generation data carries both a settlement-period label and its own UTC start time.
+On 192 half hours in the first half of 2022 they disagree by exactly a day. The label was
+trusted first, and wrongly: wind output jumped about 3,000 MW into and out of those
+half hours against about 215 MW elsewhere, so the values belonged where the start time said.
+After re-keying from the start time the jump is 194 MW against 213 MW. Which of two
+disagreeing fields to trust is a question the values can answer, and it should have been asked
+of them first.
 
 ## Data
 
@@ -218,7 +233,12 @@ python -m scripts.check_benchmark_coverage   # reconcile benchmark and baseline 
 python -m scripts.run_degradation_sweep      # frontier + figure
 python -m scripts.run_sensitivity            # duration x efficiency + figure
 python -m scripts.solve_day --file data/processed/prices_full.parquet --date 2024-10-14
+
+python -m scripts.fetch_fuelhh --start 2022-01-01 --end 2024-12-31   # wind outturn
+python -m scripts.audit_wind_block                                    # 2023 forecast block
 ```
+
+The wind audit also needs the NESO archive cached at `data/raw/neso/wind_da.parquet`.
 
 Each full-period run takes about 15 seconds.
 
@@ -226,13 +246,16 @@ Each full-period run takes about 15 seconds.
 
 ```
 src/fetch/elexon.py       Elexon API client, 7-day windows, Parquet cache
+src/fetch/elexon_fuelhh.py  Elexon generation outturn by fuel type
+src/fetch/neso.py         NESO forecast client, publication-time handling
+src/prep/forecast_skill.py  forecast error measures, block bootstrap, regeneration test
 src/prep/calendar_gb.py   settlement-period calendar, 46/48/50-period days
 src/prep/clean.py         cleaning policy, liquidity-default rule, quality reporting
 src/model/battery.py      physical specification and independent simulator
 src/model/milp.py         MILP formulation and solve
 src/model/baselines.py    trailing-percentile threshold rule
 scripts/                  command-line entry points
-tests/                    49 tests
+tests/                    107 tests
 docs/model.md             formulation, design decisions, cleaning policy
 ```
 
@@ -243,6 +266,20 @@ and plot axes only, never used as an index: 01:00 on 27 October 2024 occurs twic
 ## Open problems
 
 Unresolved, and stated here because they bear on whether the headline is right.
+
+**A 125-day block of 2023 wind forecasts may not be what was known at the time.** NESO's
+archive stamps 2023-06-01 to 2023-10-03 with a publication time after the days it forecasts.
+If the block was regenerated with hindsight it would be too accurate, and any forecast built
+on it would look better than it could have been. A seasonal-control test ruled out hindsight
+regeneration (block error 0.93 times its 2022 and 2024 peers, 95% CI 0.73 to 1.16) but was
+too weak to confirm the block genuine, and the block's error does not grow across the day as
+a day-ahead forecast's should. It is kept and flagged, and the forecast-driven result will be
+reported with and without it. Details in [`docs/model.md`](docs/model.md).
+
+**NESO's wind forecast and Elexon's wind outturn disagree by about 1 GW on average**, with the
+sign changing between years. That points to a difference in which wind farms each covers, or
+in curtailment treatment, rather than forecast error, and will be removed from error features
+using past data only.
 
 **No external benchmark comparison yet.** The obvious sanity check is against published GB
 fleet revenues, and it has not been done. It needs care: published figures cover the full

@@ -383,3 +383,120 @@ has no trailing window. `scripts/check_benchmark_coverage.py` reconciles them ex
 printing the days present in one and absent from the other in both directions, and restates
 both revenues over the 727 shared days. Asserting the reason for a day-count gap without
 checking it is how a plausible explanation survives into a README unverified.
+## Wind forecasts and outturn
+
+Wind is the dominant driver of GB price variance, and forecast error is a stronger price
+signal than forecast level. Two series are therefore needed: NESO's day-ahead wind forecast,
+and metered wind outturn to measure it against.
+
+### Sources, and why they are comparable
+
+The forecast is NESO's historic day-ahead wind archive (`Incentive_forecast`, resource
+`7524ec65`). Its `Capacity` field is defined as wind "connected to the Transmission Network".
+The outturn is Elexon FUELHH `WIND`, which is transmission-metered. Neither includes embedded
+wind on the distribution network, which appears instead as reduced national demand. The two
+therefore describe the same fleet, which is what makes an error between them meaningful.
+
+Both are keyed on `(settlement_date, settlement_period)` through this project's calendar. As
+an independent check, NESO's own UTC period start (`Datetime_GMT`) agrees with the calendar on
+all 52,608 half hours of 2022-24.
+
+### Elexon's startTime fault, and how it was found
+
+FUELHH is requested by settlement date, which avoids the UTC-boundary arithmetic the price
+client needs. Each row carries both a settlement label and Elexon's own UTC `startTime`. On
+192 half hours they disagree: every SP48 from 2022-01-01 to 2022-07-14 carries a startTime
+exactly 24 hours before its labelled period. From mid-July 2022 the disagreement stops.
+
+The two fields cannot both be right, and the first two attempts to choose between them did so
+by argument. The label was trusted first, on the grounds that it matched the calendar. A
+continuity test then decided it: wind output moves about 215 MW per half hour on an ordinary
+SP48, but about 3,000 MW into and out of the faulty ones. The values belong where startTime
+says, to the previous day's SP48. Rows are now re-keyed from startTime, per fuel, before
+revisions are resolved. After re-keying the jump into those half hours is 194 MW against 213
+MW elsewhere.
+
+The same fault explains the one row whose label cannot exist: "SP48" on the 46-period
+2022-03-27, whose startTime is 2022-03-26 23:30 UTC. It is re-keyed there. 2022-03-27 SP46 has
+no source row and stays missing.
+
+Guards, because re-keying moves values: a re-key onto a half hour another row already holds
+stops the fetch, as does re-keying more than 5% of periods, which would indicate a convention
+change rather than this fault. Rows with an impossible label and no startTime are dropped and
+their period left missing, never assigned to a guessed slot, because a missing value is
+counted by the quality report and a misplaced one is invisible.
+
+Other properties of the outturn:
+
+- 36 values were restated by Elexon; the latest publication is kept, as the best estimate of
+  what physically happened. A lagged outturn feature built from this archive therefore sees
+  the final revision rather than the value first published, a small revision look-ahead
+  recorded as a limitation.
+- 19 half hours are missing across 2022-24 for every fuel.
+- The Viking Link and Greenlink interconnector columns are missing before commissioning. For
+  features that is zero flow, not missing data.
+
+### The 2023 block of late-stamped forecasts
+
+The NESO archive's `Forecast_Timestamp` is read as London local time, decided by the stability
+of the publication hour across the seasons. On that reading, 6,048 rows in 2022-24 record a
+publication instant that does not precede the day they forecast: the whole of 2023-06-01 to
+2023-10-03 (125 days, 6,000 rows) and 2024-02-29 (48 rows). These rows use the imputed
+publication schedule and are flagged in `published_at_suspect`.
+
+A late stamp alone is a metadata fault. The danger is that the block was regenerated when it
+was rewritten, using information from after the original decision time, which would make it
+behave like the outturn and inflate every model built on it with no visible symptom. A
+regenerated forecast has one tell: it is too accurate.
+
+**Test.** Mean absolute error, as a share of installed capacity, for the block against the same
+calendar window in 2022 and 2024, both untouched. The seasonal control matters because wind
+error is seasonal; the rest of 2023 is a different season and is reported only to show why it
+cannot serve as the control. The confidence interval comes from a moving-block bootstrap over
+days in 7-day runs, because error persists with weather systems and resampling single days
+would understate the uncertainty. Thresholds were fixed before the data was examined:
+GENUINE if the CI lower bound is at least 0.80, REGENERATED if the upper bound is below 0.70,
+INCONCLUSIVE otherwise. Implemented in `src/prep/forecast_skill.py`, run by
+`scripts/audit_wind_block.py`.
+
+**Result.**
+
+| Window | MAE, % cap | Bias, % cap | Correlation | Error growth, late/early |
+|---|---|---|---|---|
+| Block 2023 | 6.15 | +2.76 | 0.919 | 1.06 |
+| Control 2022 | 6.91 | −5.50 | 0.930 | 1.30 |
+| Control 2024 | 6.38 | +4.81 | 0.934 | 1.24 |
+
+MAE ratio, block over controls: **0.926, 95% CI [0.725, 1.164]. Verdict: INCONCLUSIVE.** The
+two controls differ from each other by 1.083 [0.856, 1.386], so 125 days cannot resolve a
+10-20% difference. The thresholds were set without first checking that; the test was
+underpowered at the 0.80 threshold before it was run.
+
+What the result does establish: the lower bound excludes 0.70, so regeneration from hindsight,
+which would sit far below that, is ruled out. The following were computed after the result was
+seen, so they support the reading rather than decide it. The block has the lowest correlation
+with outturn of the three windows, and once each window's mean bias is removed its error
+spread (about 8.3% of capacity) is the largest, not the smallest. Both measures also move with
+how windy the season was, and summer 2023 was calm.
+
+The one anomaly is error growth across the day. A genuine day-ahead forecast degrades with lead
+time; the controls' error rises 24-30% from early to late periods, the block's by 6%. The block
+matches its peers early in the day and beats them late. That is consistent with the block
+having been written by a different forecasting pipeline, as the change in character of its
+capacity series already suggested. A same-day forecast would also improve the early periods,
+which it does not.
+
+**Decision.** The block is kept, on the imputed publication schedule, with its rows flagged.
+The forecast-driven backtest will be re-run with the 126 suspect days excluded, and any change
+in the headline reported beside it, so that no result rests on the verdict.
+
+### Forecast bias
+
+Mean forecast minus outturn over the June-October window is −5.5% of capacity in 2022, +2.8%
+in the 2023 block and +4.8% in 2024: around 1 GW, with its sign changing between years. A
+day-ahead forecast error that averages that far from zero over four months is not forecast
+error. The likelier causes are definitional: the set of wind farms behind NESO's capacity
+figure and behind Elexon's WIND category may differ, and the two may treat curtailment
+differently. The block test is unaffected, since each window is compared on its own terms, but
+a raw `forecast - outturn` feature would carry this offset. Error features will be de-meaned
+against a trailing bias computed from past data only.
