@@ -109,26 +109,25 @@ def test_stray_period_without_start_time_leaves_a_visible_gap():
     assert (out["gen_wind_mw"] == 999).sum() == 0
 
 
-def test_stray_label_is_relabelled_from_elexon_start_time():
-    """The case seen in the real archive: SP1-45 and an "SP48", no SP46.
+def test_start_time_is_never_used_to_reassign_a_row():
+    """Even a startTime that names the missing period does not move the value.
 
-    Elexon's startTime of 22:30 UTC is the start of SP46 on a BST day, so the
-    row is SP46 with a wrong label and its value must be kept, as SP46.
+    Elexon's startTime is the less reliable field in this archive (24 hours
+    early on every SP48 in the first half of 2022), so it is not trusted to
+    override a label.
     """
     rows = [r for r in _full_day("2022-03-27", 46) if r["settlementPeriod"] != 46]
     rows.append(_row("2022-03-27", 48, "WIND", 777, start="2022-03-27T22:30:00Z"))
     out = validate_and_grid(to_wide(pd.DataFrame(rows)), "2022-03-27", "2022-03-27")
-    assert len(out) == 46
-    assert out["gen_wind_mw"].notna().all()
-    assert out.loc[out["settlement_period"] == 46, "gen_wind_mw"].item() == 777
+    assert out.loc[out["settlement_period"] == 46, "gen_wind_mw"].isna().item()
+    assert (out["gen_wind_mw"] == 777).sum() == 0
 
 
-def test_self_contradicting_row_from_the_archive_is_quarantined():
+def test_real_archive_row_is_quarantined():
     """The real 2022-03-27 row: labelled SP48, startTime 2022-03-26 23:30 UTC.
 
-    That start time is SP48 of the previous day, already present, so it does
-    not identify the missing SP46. The row is dropped, SP46 stays NaN, and the
-    previous day's SP48 is untouched.
+    The row is dropped, SP46 stays NaN, and the previous day's SP48, which the
+    startTime happens to name, is untouched.
     """
     rows = _full_day("2022-03-26", 48)
     rows += [r for r in _full_day("2022-03-27", 46) if r["settlementPeriod"] != 46]

@@ -39,7 +39,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.fetch.elexon import BASE_URL, _session
-from src.prep.calendar_gb import expected_periods_in_day, from_utc, settlement_period_grid
+from src.prep.calendar_gb import expected_periods_in_day, settlement_period_grid
 
 log = logging.getLogger(__name__)
 
@@ -138,8 +138,9 @@ def to_wide(raw: pd.DataFrame) -> pd.DataFrame:
                     values="generation")
     wide.columns = [f"gen_{c}_mw" for c in wide.columns]
 
-    # startTime is Elexon's own UTC start of the period. Kept as a cross-check on
-    # this project's calendar and on NESO's Datetime_GMT, never as a join key.
+    # startTime is Elexon's own UTC start of the period. Kept only as a cross-check
+    # on this project's calendar, never as a key: it is wrong by 24 hours on every
+    # SP48 from 2022-01-01 to 2022-07-14 (see quarantine_out_of_range).
     if "startTime" in df.columns:
         start = df.drop_duplicates(["settlement_date", "settlement_period"]).set_index(
             ["settlement_date", "settlement_period"]
@@ -155,72 +156,48 @@ def to_wide(raw: pd.DataFrame) -> pd.DataFrame:
 MAX_OUT_OF_RANGE = 10
 
 
-def repair_out_of_range(wide: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Resolve rows whose settlement period cannot exist on their settlement day.
+def quarantine_out_of_range(wide: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Drop rows whose settlement period cannot exist on their settlement day.
 
-    Each stray row is judged by Elexon's own `startTime`, an unambiguous UTC
-    instant, never by guessing from the label. Two outcomes:
+    A dropped row leaves its period NaN on the grid, where the quality report
+    counts it and the cleaning policy handles it, so the loss is visible. The
+    alternative, reassigning the value to the period it "probably" is, plants a
+    value that no later check can detect.
 
-    1. Relabel, only when the start time maps through this project's calendar
-       to a valid period of the SAME settlement day that is otherwise missing.
-    2. Quarantine, in every other case. The row is dropped and, if its day was
-       missing a period, that period stays NaN on the grid.
+    Elexon's `startTime` is deliberately not used to reassign rows, because in
+    this archive it is the less reliable field. From 2022-01-01 to 2022-07-14,
+    every SP48 row carries a startTime exactly 24 hours early (the previous
+    day's SP48), while its label matches the calendar. The one out-of-range row,
+    2022-03-27 "SP48" on a 46-period day, carries that same early startTime, so
+    it is most likely that day's final period numbered as if the day had 48.
+    Neither field identifies it with confidence, so it is dropped and
+    2022-03-27 SP46 stays missing: one half hour, outside the study period.
 
-    The asymmetry is deliberate. A dropped row becomes a NaN that the quality
-    report counts and the cleaning policy handles, so the loss is visible. A row
-    assigned to a guessed period plants a value no later check can detect. When
-    the metadata does not identify the row, a visible gap is the honest result.
-
-    Seen in the archive: 2022-03-27 (46 periods) arrives as SP1-45 plus an
-    "SP48" whose startTime, 2022-03-26 23:30 UTC, is SP48 of the previous day,
-    which is already present. The row contradicts itself and is quarantined;
-    2022-03-27 SP46 is left missing.
-
-    Returns (repaired frame, log of stray rows with the action taken). Raises
-    above MAX_OUT_OF_RANGE stray rows, which would indicate a systematic fault.
+    Returns (kept, quarantined). Raises above MAX_OUT_OF_RANGE stray rows,
+    which would indicate a systematic change of period convention.
     """
     max_sp = wide["settlement_date"].map(
         {d: expected_periods_in_day(d) for d in wide["settlement_date"].unique()}
     )
     bad = (wide["settlement_period"] > max_sp) | (wide["settlement_period"] < 1)
-    if not bad.any():
-        return wide, wide.iloc[0:0].assign(action=pd.Series(dtype=str))
+    quarantined = wide.loc[bad]
+    if quarantined.empty:
+        return wide, quarantined
 
-    if bad.sum() > MAX_OUT_OF_RANGE:
+    if len(quarantined) > MAX_OUT_OF_RANGE:
         raise ValueError(
-            f"{int(bad.sum())} FUELHH rows have a settlement period outside the valid "
+            f"{len(quarantined)} FUELHH rows have a settlement period outside the valid "
             f"range for their day, above the tolerance of {MAX_OUT_OF_RANGE}. First rows:\n"
-            f"{wide.loc[bad, ['settlement_date', 'settlement_period']].head()}"
+            f"{quarantined[['settlement_date', 'settlement_period']].head()}"
         )
 
-    out = wide.copy()
-    actions = {}
-    for i in out.index[bad]:
-        day = out.at[i, "settlement_date"]
-        label = int(out.at[i, "settlement_period"])
-        others = out.index[(out["settlement_date"] == day) & ~bad]
-        present = set(out.loc[others, "settlement_period"].astype(int))
-        missing = set(range(1, expected_periods_in_day(day) + 1)) - present
-
-        start = out.at[i, "elexon_start_utc"] if "elexon_start_utc" in out.columns else None
-        implied = from_utc(pd.Timestamp(start)) if pd.notna(start) else None
-
-        if implied and pd.Timestamp(implied[0]) == pd.Timestamp(day) and implied[1] in missing:
-            out.at[i, "settlement_period"] = implied[1]
-            actions[i] = f"relabelled SP{label} -> SP{implied[1]} from startTime {start}"
-        elif not missing:
-            actions[i] = "quarantined: every valid period of the day is present"
-        else:
-            actions[i] = (
-                f"quarantined: startTime {start} does not identify missing period(s) "
-                f"{sorted(missing)}, which stay NaN"
-            )
-
-    log_frame = wide.loc[bad].assign(action=pd.Series(actions)).dropna(axis=1, how="all")
-    log.warning("FUELHH: %s stray settlement period(s) resolved:\n%s",
-                len(log_frame), log_frame.to_string())
-    keep = ~out.index.isin([i for i, a in actions.items() if a.startswith("quarantined")])
-    return out.loc[keep], log_frame
+    log.warning(
+        "FUELHH: quarantined %s row(s) with a settlement period that cannot exist on "
+        "their day; any period they displaced stays NaN:\n%s",
+        len(quarantined),
+        quarantined.dropna(axis=1, how="all").to_string(),
+    )
+    return wide.loc[~bad], quarantined
 
 
 def validate_and_grid(wide: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
@@ -229,10 +206,10 @@ def validate_and_grid(wide: pd.DataFrame, start_date: str, end_date: str) -> pd.
     Same order of checks as the MID client, for the same reason: an out-of-range
     period must be caught while it is still a label, because once converted to a
     timestamp SP50 on a 48-period day becomes a valid half hour of the next day.
-    Unlike the MID client, a few stray labels are repaired or quarantined rather
-    than fatal, because FUELHH does serve them; see repair_out_of_range.
+    Unlike the MID client, a few stray labels are quarantined rather than fatal,
+    because FUELHH does serve them; see quarantine_out_of_range.
     """
-    wide, _ = repair_out_of_range(wide)
+    wide, _ = quarantine_out_of_range(wide)
     if wide.duplicated(["settlement_date", "settlement_period"]).any():
         raise ValueError("duplicate settlement periods in FUELHH after pivoting")
 
