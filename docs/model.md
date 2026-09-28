@@ -500,3 +500,49 @@ figure and behind Elexon's WIND category may differ, and the two may treat curta
 differently. The block test is unaffected, since each window is compared on its own terms, but
 a raw `forecast - outturn` feature would carry this offset. Error features will be de-meaned
 against a trailing bias computed from past data only.
+
+## Point-in-time data
+
+Every delivery half hour of day D is scheduled once, at 11:00 London time on D-1, and may use
+only information published strictly before that instant. The decision time is built in local
+clock time and converted to UTC, so it is 10:00 UTC in summer and 11:00 UTC in winter.
+
+### Canonical forecast tables
+
+Both NESO archives are rewritten into one long shape: target half hour, publication instant,
+value. The target half hour is derived from the settlement date and period through the
+project calendar, not from either archive's own timestamp column, because the two archives
+disagree about what those columns mean. Demand outturn is written to a separate table, so a
+feature query cannot read it by accident.
+
+Each table must hold one value per target and publication instant; otherwise "the latest
+forecast before the decision" has two answers. The check found one violation: on the
+2022-10-30 clock change the demand archive repeats settlement periods 2 and 3 with the same
+publication instant. The tables are built from 2023, matching the price data, and the 2023
+and 2024 clock changes pass.
+
+### The as-of join
+
+`sql/point_in_time.sql` joins each decision to the latest forecast for the same half hour
+published strictly before the decision time, using DuckDB's `ASOF LEFT JOIN`. Strictly,
+because a forecast published at the decision instant cannot be acted on in that instant.
+LEFT, so a half hour with no usable forecast keeps its row with a missing value rather than
+disappearing. DuckDB was chosen for this join, not for data volume: SQLite has no as-of
+join, and Postgres needs a server.
+
+The build script does not trust the SQL. It re-checks every attached forecast against its
+decision time and counts, with a separate plain join, the forecasts that existed but were
+published too late.
+
+| | Attached | Published after decision | Excluded as too late | Margin before decision |
+|---|---|---|---|---|
+| Wind | 34,992 of 35,088 | 0 | 96 | 0.67 to 4.08 h |
+| Demand | 35,088 of 35,088 | 0 | 0 | 0.25 to 2.25 h |
+
+The 96 excluded wind forecasts are two whole days whose forecasts were published after 11:00
+the day before. They are left missing rather than filled, since filling them would use a
+forecast that did not exist at the decision time.
+
+Demand is published at least 13.25 hours before the delivery day starts, which is 10:45
+London time, so the 11:00 decision has 15 minutes to spare. A decision before 10:45 would lose
+the demand forecast entirely on the conservative reading of its timestamp.

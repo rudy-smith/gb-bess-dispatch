@@ -8,7 +8,7 @@ solved schedule against an independent replay engine that shares no code with th
 
 Supporting it is a full data pipeline: GB settlement-period handling across clock changes,
 detection of liquidity-defaulted prices against the BSC rulebook, daily optimisation with the
-HiGHS solver, and a 107-test suite covering constraints and analytically checkable cases.
+HiGHS solver, and a 130-test suite covering constraints and analytically checkable cases.
 
 ## Key result
 
@@ -40,7 +40,10 @@ which is the trade-off between battery lifetime and arbitrage profit made explic
   Elexon's timestamps found and corrected (see below)
 - **Wind forecast audit**: a seasonal-control test for whether a block of archived forecasts
   was regenerated with hindsight
-- **107 tests** covering the calendar, cleaner, battery constraints, degenerate cases, the
+- **Point-in-time data layer**: DuckDB views over the Parquet files and an as-of join that
+  attaches to each half hour only the forecasts published before its decision time, 11:00 on
+  the previous day. The build re-checks every row and counts what the join excluded
+- **130 tests** covering the calendar, cleaner, battery constraints, degenerate cases, the
   data clients and the audit statistics
 
 ## Results
@@ -169,7 +172,7 @@ cannot cancel out and pass.
 - The parameter sweep and the direct benchmark solve agree to the pound on the shared cell
 
 ```powershell
-python -m pytest tests/ -q     # 107 passed
+python -m pytest tests/ -q     # 130 passed
 ```
 
 ### What validation caught
@@ -236,6 +239,9 @@ python -m scripts.solve_day --file data/processed/prices_full.parquet --date 202
 
 python -m scripts.fetch_fuelhh --start 2022-01-01 --end 2024-12-31   # wind outturn
 python -m scripts.audit_wind_block                                    # 2023 forecast block
+
+python -m scripts.build_forecast_tables    # canonical NESO forecast tables
+python -m scripts.build_point_in_time      # forecasts as known at each decision
 ```
 
 The wind audit also needs the NESO archive cached at `data/raw/neso/wind_da.parquet`.
@@ -249,13 +255,17 @@ src/fetch/elexon.py       Elexon API client, 7-day windows, Parquet cache
 src/fetch/elexon_fuelhh.py  Elexon generation outturn by fuel type
 src/fetch/neso.py         NESO forecast client, publication-time handling
 src/prep/forecast_skill.py  forecast error measures, block bootstrap, regeneration test
+src/prep/forecast_tables.py  canonical forecast tables, demand outturn kept separate
+src/prep/decisions.py     decision time for every delivery half hour
+src/db/duck.py            DuckDB views over the Parquet files, query helpers
+sql/point_in_time.sql     as-of join of forecasts onto decisions
 src/prep/calendar_gb.py   settlement-period calendar, 46/48/50-period days
 src/prep/clean.py         cleaning policy, liquidity-default rule, quality reporting
 src/model/battery.py      physical specification and independent simulator
 src/model/milp.py         MILP formulation and solve
 src/model/baselines.py    trailing-percentile threshold rule
 scripts/                  command-line entry points
-tests/                    107 tests
+tests/                    130 tests
 docs/model.md             formulation, design decisions, cleaning policy
 ```
 
@@ -321,6 +331,9 @@ is still positive.
   calendar ageing or temperature coupling
 - No network constraints, outages or derating; single asset, single connection point
 - Two years of one volatility regime
+- Decisions are fixed at 11:00 on the previous day, chosen to follow NESO's publication
+  times rather than an auction gate closure. An earlier decision loses the demand forecast,
+  which is published as late as 10:45
 
 ## Next
 

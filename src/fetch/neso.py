@@ -146,7 +146,7 @@ RESOURCES: dict[str, NesoResource] = {
         # information rather than granting it early.
         #
         # The ambiguity is bounded and does not reach this design: lead time is
-        # a constant 13.25 hours with zero variance, so one hour of uncertainty
+        # at least 13.25 hours (13.25 to 15.25 across 2023-24), so one hour of uncertainty
         # cannot bring publication inside the settlement day. It would matter
         # at an intraday horizon, and is recorded as a limitation on that
         # basis rather than resolved by assumption.
