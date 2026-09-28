@@ -358,10 +358,11 @@ def resolve_published_at(
     describes. Rows failing it fall back to the imputed schedule and are
     flagged, so a caller can drop them rather than silently inherit a repair.
  
-    Timestamps in these archives are naive and in UTC. That is established by
-    the publication window rather than assumed: converted to London time they
-    sit in the morning window NESO documents, where reading them as local time
-    would place them an hour earlier and outside it.
+    Timestamps in these archives are naive, and how they are read is a
+    per-resource setting (`timestamp_timezone`), not a shared assumption. The
+    wind archive is local clock time, established by the seasonal stability of
+    its publication hour across the whole archive; the demand archive is
+    unresolved and read as UTC, the later and therefore conservative reading.
     """
     out = frame.copy()
     imputed = impute_published_at(out[target_date_column], resource)
