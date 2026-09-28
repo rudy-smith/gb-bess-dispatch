@@ -3,7 +3,13 @@
 import pandas as pd
 import pytest
 
-from src.fetch.elexon_fuelhh import date_windows, fetch_month_raw, to_wide, validate_and_grid
+from src.fetch.elexon_fuelhh import (
+    date_windows,
+    fetch_month_raw,
+    labels_from_start_time,
+    to_wide,
+    validate_and_grid,
+)
 
 
 def _row(date, sp, fuel, gen, publish="2023-06-02T00:00:00Z", start=None):
@@ -109,35 +115,73 @@ def test_stray_period_without_start_time_leaves_a_visible_gap():
     assert (out["gen_wind_mw"] == 999).sum() == 0
 
 
-def test_start_time_is_never_used_to_reassign_a_row():
-    """Even a startTime that names the missing period does not move the value.
+@pytest.mark.parametrize(
+    "start, date, sp",
+    [
+        ("2023-06-01T22:30:00Z", "2023-06-01", 48),  # BST: last period of the day
+        ("2023-06-01T23:00:00Z", "2023-06-02", 1),  # BST: local midnight
+        ("2024-01-15T23:30:00Z", "2024-01-15", 48),  # GMT
+        ("2024-03-31T01:00:00Z", "2024-03-31", 3),  # just after spring forward
+        ("2023-10-29T01:00:00Z", "2023-10-29", 5),  # second 01:00 local, autumn
+        ("2023-10-29T23:30:00Z", "2023-10-29", 50),  # last period of a 50-period day
+    ],
+)
+def test_labels_from_start_time(start, date, sp):
+    d, p = labels_from_start_time(pd.Series([start]))
+    assert d.iloc[0] == pd.Timestamp(date)
+    assert p.iloc[0] == sp
 
-    Elexon's startTime is the less reliable field in this archive (24 hours
-    early on every SP48 in the first half of 2022), so it is not trusted to
-    override a label.
+
+def _day_without_sp48(date):
+    return [r for r in _full_day(date, 48) if r["settlementPeriod"] != 48]
+
+
+def test_day_early_sp48_is_moved_to_its_start_time():
+    """The 2022 fault: a row labelled D SP48 holds D-1 SP48, per its startTime."""
+    rows = _day_without_sp48("2022-01-02") + _day_without_sp48("2022-01-03")
+    rows.append(_row("2022-01-02", 48, "WIND", 11, start="2022-01-01T23:30:00Z"))
+    rows.append(_row("2022-01-03", 48, "WIND", 22, start="2022-01-02T23:30:00Z"))
+    wide = to_wide(pd.DataFrame(rows))
+    wide = wide[wide["settlement_date"] >= pd.Timestamp("2022-01-02")]
+    out = validate_and_grid(wide, "2022-01-02", "2022-01-03")
+    at = out.set_index(["settlement_date", "settlement_period"])["gen_wind_mw"]
+    assert at[(pd.Timestamp("2022-01-02"), 48)] == 22
+    assert pd.isna(at[(pd.Timestamp("2022-01-03"), 48)])
+    assert (out["gen_wind_mw"] == 11).sum() == 0  # moved to 2022-01-01, outside range
+
+
+def test_real_archive_row_moves_to_the_previous_day():
+    """2022-03-27 "SP48" with startTime 2022-03-26 23:30 UTC is 2022-03-26 SP48.
+
+    2022-03-27 SP46 has no source row, so it stays NaN rather than being filled.
     """
-    rows = [r for r in _full_day("2022-03-27", 46) if r["settlementPeriod"] != 46]
-    rows.append(_row("2022-03-27", 48, "WIND", 777, start="2022-03-27T22:30:00Z"))
-    out = validate_and_grid(to_wide(pd.DataFrame(rows)), "2022-03-27", "2022-03-27")
-    assert out.loc[out["settlement_period"] == 46, "gen_wind_mw"].isna().item()
-    assert (out["gen_wind_mw"] == 777).sum() == 0
-
-
-def test_real_archive_row_is_quarantined():
-    """The real 2022-03-27 row: labelled SP48, startTime 2022-03-26 23:30 UTC.
-
-    The row is dropped, SP46 stays NaN, and the previous day's SP48, which the
-    startTime happens to name, is untouched.
-    """
-    rows = _full_day("2022-03-26", 48)
+    rows = _day_without_sp48("2022-03-26")
     rows += [r for r in _full_day("2022-03-27", 46) if r["settlementPeriod"] != 46]
     rows.append(_row("2022-03-27", 48, "WIND", 999, start="2022-03-26T23:30:00Z"))
     out = validate_and_grid(to_wide(pd.DataFrame(rows)), "2022-03-26", "2022-03-27")
-    assert len(out) == 48 + 46
-    assert out["gen_wind_mw"].isna().sum() == 1
-    day27 = out[out["settlement_date"] == pd.Timestamp("2022-03-27")]
-    assert day27.loc[day27["settlement_period"] == 46, "gen_wind_mw"].isna().item()
-    assert (out["gen_wind_mw"] == 999).sum() == 0
+    at = out.set_index(["settlement_date", "settlement_period"])["gen_wind_mw"]
+    assert at[(pd.Timestamp("2022-03-26"), 48)] == 999
+    assert pd.isna(at[(pd.Timestamp("2022-03-27"), 46)])
+
+
+def test_rekey_collision_raises():
+    """Two rows claiming one half hour: choosing between them would be a guess."""
+    rows = _day_without_sp48("2022-01-02")
+    rows.append(_row("2022-01-02", 48, "WIND", 1, start="2022-01-02T23:30:00Z"))
+    rows.append(_row("2022-01-03", 48, "WIND", 2, start="2022-01-02T23:30:00Z"))
+    with pytest.raises(ValueError, match="same half hour"):
+        to_wide(pd.DataFrame(rows))
+
+
+def test_widespread_disagreement_raises():
+    """A one-hour shift on every row is a convention change, not the known fault."""
+    rows = [
+        _row("2023-06-01", sp, "WIND", 1,
+             start=f"{pd.Timestamp('2023-05-31T23:00Z') + pd.Timedelta(minutes=30 * sp):%Y-%m-%dT%H:%M:%SZ}")
+        for sp in range(1, 49)
+    ]
+    with pytest.raises(ValueError, match="tolerance"):
+        to_wide(pd.DataFrame(rows))
 
 
 def test_many_stray_periods_raise():

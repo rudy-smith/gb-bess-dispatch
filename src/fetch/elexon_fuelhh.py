@@ -39,7 +39,12 @@ from pathlib import Path
 import pandas as pd
 
 from src.fetch.elexon import BASE_URL, _session
-from src.prep.calendar_gb import expected_periods_in_day, settlement_period_grid
+from src.prep.calendar_gb import (
+    LONDON,
+    UTC,
+    expected_periods_in_day,
+    settlement_period_grid,
+)
 
 log = logging.getLogger(__name__)
 
@@ -110,15 +115,105 @@ def fetch_month_raw(session, month_start: pd.Timestamp) -> pd.DataFrame:
     return df[keep].reset_index(drop=True)
 
 
+# Largest share of settlement periods that may be re-keyed from startTime before
+# the fetch is refused. The known fault moves one period per day (about 2%); a
+# timezone or convention change would move most of them, and must stop the
+# pipeline rather than be silently "corrected".
+MAX_REKEYED_SHARE = 0.05
+
+
+def labels_from_start_time(start_utc: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """UTC period start -> (settlement_date, settlement_period), vectorised.
+
+    The same mapping as calendar_gb.from_utc: the settlement date is the local
+    date, and the period counts real half hours from local midnight, which is
+    what makes 46- and 50-period days come out right.
+    """
+    ts = pd.to_datetime(start_utc, utc=True)
+    local_date = ts.dt.tz_convert(LONDON).dt.tz_localize(None).dt.normalize()
+    midnight_utc = local_date.dt.tz_localize(LONDON).dt.tz_convert(UTC)
+    elapsed = (ts - midnight_utc) / pd.Timedelta(minutes=30)
+    return local_date, elapsed.round().astype("Int64") + 1
+
+
+def rekey_from_start_time(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace each row's settlement labels with those implied by its startTime.
+
+    Why startTime wins. From 2022-01-01 to 2022-07-14, every row labelled SP48
+    carries a startTime exactly 24 hours before the labelled period. The values
+    side with startTime: wind output jumps about 3,000 MW into and out of those
+    labelled slots, against about 215 MW on unaffected SP48s, so the value
+    belongs to the previous day's SP48 and the label is what is wrong. UTC is
+    this project's canonical identity for a half hour anyway; the label is
+    derived from it, not the reverse.
+
+    Guards, because re-keying moves values:
+      - A re-keyed row landing on a key another row already holds raises. That
+        would be two sources for one half hour, and picking one is a guess.
+      - More than MAX_REKEYED_SHARE of periods re-keyed raises.
+      - Rows with no startTime keep their labels.
+
+    Adds a boolean `rekeyed` column. Works on the long frame, one row per fuel,
+    so each fuel is keyed by its own startTime.
+    """
+    out = df.copy()
+    out["rekeyed"] = False
+    if "startTime" not in out.columns:
+        return out
+
+    has = out["startTime"].notna()
+    if not has.any():
+        return out
+    new_date, new_sp = labels_from_start_time(out.loc[has, "startTime"])
+    moved = (new_date != out.loc[has, "settlement_date"]) | (
+        new_sp != out.loc[has, "settlement_period"]
+    )
+    idx = moved[moved].index
+    if len(idx) == 0:
+        return out
+
+    periods = out[["settlement_date", "settlement_period"]].drop_duplicates()
+    moved_periods = out.loc[idx, ["settlement_date", "settlement_period"]].drop_duplicates()
+    if len(moved_periods) > MAX_REKEYED_SHARE * len(periods):
+        raise ValueError(
+            f"{len(moved_periods)} of {len(periods)} FUELHH periods have a startTime that "
+            f"disagrees with their label, above the {MAX_REKEYED_SHARE:.0%} tolerance. "
+            "This looks like a convention change, not the known SP48 fault."
+        )
+
+    out.loc[idx, "settlement_date"] = new_date.loc[idx]
+    out.loc[idx, "settlement_period"] = new_sp.loc[idx].astype(int)
+    out.loc[idx, "rekeyed"] = True
+
+    key = ["settlement_date", "settlement_period", "fuel"]
+    # Only keys held by more than one row can clash; checking that subset keeps
+    # this fast on the ~1M-row long frame.
+    shared = out.duplicated(key, keep=False)
+    clash = shared & out[key].merge(
+        out.loc[shared].groupby(key, as_index=False)["rekeyed"].any(), on=key, how="left"
+    )["rekeyed"].fillna(False).to_numpy()
+    if clash.any():
+        raise ValueError(
+            "re-keying FUELHH from startTime put two rows on the same half hour:\n"
+            f"{out.loc[clash, key + ['startTime', 'rekeyed']].head(10)}"
+        )
+    log.warning(
+        "FUELHH: %s row(s) across %s period(s) re-keyed from startTime; first: %s",
+        len(idx), len(moved_periods), moved_periods.head(3).to_dict("records"),
+    )
+    return out
+
+
 def to_wide(raw: pd.DataFrame) -> pd.DataFrame:
     """Long (one row per fuel per period) -> one row per settlement period.
 
-    Revisions: if the same (date, period, fuel) appears more than once, the row
+    Rows are first re-keyed from startTime (see rekey_from_start_time). Then
+    revisions: if the same (date, period, fuel) appears more than once, the row
     with the latest publishTime is kept. For outturn, the latest revision is the
     best estimate of what physically happened, which is what a target should be.
-    The count is logged so a revision-heavy month is visible rather than absorbed.
 
-    Columns come out as gen_<fuel>_mw, e.g. gen_wind_mw, gen_ccgt_mw.
+    Columns come out as gen_<fuel>_mw, plus `rekeyed` (any fuel in the period
+    was moved) and `elexon_start_utc`.
     """
     df = raw.copy()
     df["settlement_date"] = pd.to_datetime(df["settlementDate"]).dt.normalize()
@@ -127,6 +222,10 @@ def to_wide(raw: pd.DataFrame) -> pd.DataFrame:
     df["generation"] = pd.to_numeric(df["generation"], errors="coerce")
     df["publish_time"] = pd.to_datetime(df["publishTime"], utc=True, errors="coerce")
 
+    # Re-keying runs before revision handling. The other order would let "keep
+    # the latest revision" silently resolve a collision the re-key created.
+    df = rekey_from_start_time(df)
+
     key = ["settlement_date", "settlement_period", "fuel"]
     df = df.sort_values(key + ["publish_time"])
     revised = int(df.duplicated(key).sum())
@@ -134,19 +233,14 @@ def to_wide(raw: pd.DataFrame) -> pd.DataFrame:
         log.info("FUELHH: %s superseded revisions dropped, latest publishTime kept", revised)
     df = df.drop_duplicates(key, keep="last")
 
-    wide = df.pivot(index=["settlement_date", "settlement_period"], columns="fuel",
-                    values="generation")
+    period = ["settlement_date", "settlement_period"]
+    wide = df.pivot(index=period, columns="fuel", values="generation")
     wide.columns = [f"gen_{c}_mw" for c in wide.columns]
-
-    # startTime is Elexon's own UTC start of the period. Kept only as a cross-check
-    # on this project's calendar, never as a key: it is wrong by 24 hours on every
-    # SP48 from 2022-01-01 to 2022-07-14 (see quarantine_out_of_range).
+    wide["rekeyed"] = df.groupby(period)["rekeyed"].any()
     if "startTime" in df.columns:
-        start = df.drop_duplicates(["settlement_date", "settlement_period"]).set_index(
-            ["settlement_date", "settlement_period"]
-        )["startTime"]
-        wide["elexon_start_utc"] = pd.to_datetime(start, utc=True)
-
+        wide["elexon_start_utc"] = pd.to_datetime(
+            df.drop_duplicates(period).set_index(period)["startTime"], utc=True
+        )
     return wide.reset_index()
 
 
@@ -164,14 +258,10 @@ def quarantine_out_of_range(wide: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
     alternative, reassigning the value to the period it "probably" is, plants a
     value that no later check can detect.
 
-    Elexon's `startTime` is deliberately not used to reassign rows, because in
-    this archive it is the less reliable field. From 2022-01-01 to 2022-07-14,
-    every SP48 row carries a startTime exactly 24 hours early (the previous
-    day's SP48), while its label matches the calendar. The one out-of-range row,
-    2022-03-27 "SP48" on a 46-period day, carries that same early startTime, so
-    it is most likely that day's final period numbered as if the day had 48.
-    Neither field identifies it with confidence, so it is dropped and
-    2022-03-27 SP46 stays missing: one half hour, outside the study period.
+    Runs after rekey_from_start_time, so only rows with no startTime can still
+    be out of range here. The one out-of-range row in the archive, 2022-03-27
+    "SP48", has a startTime and is re-keyed to 2022-03-26 SP48 before reaching
+    this point.
 
     Returns (kept, quarantined). Raises above MAX_OUT_OF_RANGE stray rows,
     which would indicate a systematic change of period convention.
@@ -262,7 +352,12 @@ def fetch_fuelhh(
 
 
 def fuelhh_quality_report(df: pd.DataFrame) -> pd.DataFrame:
-    """Missing periods per fuel column, and the Elexon/project calendar agreement."""
+    """Missing periods per fuel, calendar agreement, and a check on the re-key.
+
+    The re-key check is the continuity test that exposed the fault. Wind output
+    moves little in half an hour, so if the re-keyed values now sit in their true
+    half hours, the jump into and out of them matches the jump elsewhere.
+    """
     gen_cols = [c for c in df.columns if c.startswith("gen_")]
     rows = [{"check": f"{c}_missing", "value": int(df[c].isna().sum())} for c in gen_cols]
     rows.insert(0, {"check": "periods_expected", "value": len(df)})
@@ -270,4 +365,14 @@ def fuelhh_quality_report(df: pd.DataFrame) -> pd.DataFrame:
         present = df["elexon_start_utc"].notna()
         agree = (df.loc[present, "elexon_start_utc"] == df.index[present]).sum()
         rows.append({"check": "elexon_start_matches_calendar", "value": f"{agree} of {present.sum()}"})
+    if "rekeyed" in df.columns and "gen_wind_mw" in df.columns:
+        moved = df["rekeyed"].fillna(False).astype(bool)
+        jump_in = df["gen_wind_mw"].diff().abs()
+        jump_out = jump_in.shift(-1)
+        rows += [
+            {"check": "periods_rekeyed_from_start_time", "value": int(moved.sum())},
+            {"check": "wind_jump_into_rekeyed_mw", "value": round(jump_in[moved].mean())},
+            {"check": "wind_jump_out_of_rekeyed_mw", "value": round(jump_out[moved].mean())},
+            {"check": "wind_jump_elsewhere_mw", "value": round(jump_in[~moved].mean())},
+        ]
     return pd.DataFrame(rows)
