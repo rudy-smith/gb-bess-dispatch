@@ -25,7 +25,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from src.prep.decisions import DEFAULT_DECISION_TIME, decision_table
+from src.prep.decisions import DEFAULT_DECISION_TIME, calendar_table, decision_table
 
 DATA_DIR = Path("data")
 SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
@@ -37,6 +37,7 @@ VIEWS: dict[str, str] = {
     "demand_forecasts": "processed/demand_forecasts.parquet",
     "demand_outturn": "processed/demand_outturn.parquet",
     "generation": "processed/fuelhh.parquet",
+    "point_in_time": "processed/point_in_time.parquet",
 }
 
 
@@ -90,14 +91,25 @@ def register_decisions(
     con.register("decisions", decision_table(start_date, end_date, decision_local))
 
 
-def query(con: duckdb.DuckDBPyConnection, sql: str, params: list | None = None) -> pd.DataFrame:
+def register_calendar(con: duckdb.DuckDBPyConnection, start_date: str, end_date: str) -> None:
+    """Register local clock keys for every half hour as the view `calendar`.
+
+    The range must reach back far enough to cover the longest lag a query uses,
+    not just the delivery days, or the earliest lags silently come back NULL.
+    """
+    con.register("calendar", calendar_table(start_date, end_date))
+
+
+def query(
+    con: duckdb.DuckDBPyConnection, sql: str, params: list | dict | None = None
+) -> pd.DataFrame:
     """Run SQL and return a DataFrame. Values are passed as bound parameters,
-    never formatted into the string."""
+    positional (?) or named ($name), never formatted into the string."""
     return con.execute(sql, params or []).df()
 
 
 def query_file(
-    con: duckdb.DuckDBPyConnection, name: str, params: list | None = None
+    con: duckdb.DuckDBPyConnection, name: str, params: list | dict | None = None
 ) -> pd.DataFrame:
     """Run sql/<name>.sql. Queries live in files so they can be read, diffed and
     reviewed as SQL, not as strings inside Python."""

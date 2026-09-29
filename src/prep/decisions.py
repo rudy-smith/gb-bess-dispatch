@@ -63,3 +63,35 @@ def decision_table(
     if not (out["decision_time"] < out.groupby("settlement_date")["target_time"].transform("min")).all():
         raise ValueError("a decision time falls inside its own delivery day")
     return out
+
+
+def calendar_table(start_date: str, end_date: str) -> pd.DataFrame:
+    """Local clock keys for every half hour, for joins that follow the wall clock.
+
+    Price shape follows human activity, which follows the local clock, so "the same
+    half hour two days earlier" means the same local clock time, not 48 hours
+    earlier in UTC. Across a clock change the two differ by an hour.
+
+    Columns: target_time (UTC), local_date (naive midnight), minute_of_day (local
+    minutes since midnight), day_of_week (0 = Monday), month, first_occurrence.
+
+    first_occurrence is False for the second pass through 01:00-02:00 on the
+    autumn clock-change day. As a SOURCE of a clock-time lag, only the first pass
+    is used, so each (local_date, minute_of_day) names exactly one half hour and a
+    lag join cannot fan out. As a TARGET, both passes keep their own rows.
+    """
+    grid = settlement_period_grid(start_date, end_date).reset_index()
+    local = grid["start_time_local"]
+    local_date = local.dt.tz_localize(None).dt.normalize()
+    minute = local.dt.hour * 60 + local.dt.minute
+    out = pd.DataFrame(
+        {
+            "target_time": grid["start_time_utc"],
+            "local_date": local_date,
+            "minute_of_day": minute.astype(int),
+            "day_of_week": local.dt.dayofweek.astype(int),
+            "month": local.dt.month.astype(int),
+        }
+    )
+    out["first_occurrence"] = ~out.duplicated(["local_date", "minute_of_day"])
+    return out
