@@ -41,6 +41,9 @@ px AS (
     FROM prices AS p
     JOIN calendar AS c ON c.target_time = p.start_time_utc
     WHERE p.price_apx IS NOT NULL
+      -- A gap filled by interpolation depends on the price AFTER it, which may
+      -- not be public at the decision. Filled values are never feature sources.
+      AND NOT coalesce(p.price_apx_interpolated, false)
 ),
 
 px_daily AS (

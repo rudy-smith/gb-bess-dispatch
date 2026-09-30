@@ -11,6 +11,10 @@ Publication lag: a price or metered output is treated as public PUBLICATION_LAG
 minutes after its half hour ends. Elexon publishes both within minutes; an hour
 is deliberately generous, and the choice cannot create look-ahead because every
 lag join requires availability strictly before the decision.
+
+Prices filled by the cleaner's short-gap interpolation are never feature
+sources. Interpolation is two-sided, so a filled value at t depends on the
+observed price at t+1, which may not have been public at the decision.
 """
 
 from __future__ import annotations

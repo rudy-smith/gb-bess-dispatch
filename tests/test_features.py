@@ -25,8 +25,10 @@ def _decode(hours):
     return EPOCH + pd.to_timedelta(hours, unit="h")
 
 
-def _build(tmp_path, start, end, lag=LAG):
-    """Write synthetic processed files for [start, end] and return the feature frame."""
+def _build(tmp_path, start, end, lag=LAG, interpolated=()):
+    """Write synthetic processed files for [start, end] and return the feature frame.
+
+    `interpolated` lists UTC start times whose price is flagged as filled."""
     proc = tmp_path / "processed"
     proc.mkdir()
     grid = settlement_period_grid(start, end).reset_index()
@@ -36,6 +38,9 @@ def _build(tmp_path, start, end, lag=LAG):
     prices = pd.DataFrame(
         {"price_apx": _hours(t).to_numpy(), "period_usable": True, "day_usable": True},
         index=pd.DatetimeIndex(t, name="start_time_utc"),
+    )
+    prices["price_apx_interpolated"] = prices.index.isin(
+        pd.DatetimeIndex([pd.Timestamp(x, tz="UTC") for x in interpolated])
     )
     prices.to_parquet(proc / "prices_full.parquet")
 
@@ -163,6 +168,22 @@ def test_too_long_a_lag_gives_nulls_not_leaks(tmp_path):
     assert tail["f_price_d7_same_time"].notna().all()
 
 
+def test_interpolated_price_is_never_a_source(tmp_path):
+    """2024-03-19 is in GMT, so the decision for 2024-03-20 is 11:00 UTC and the
+    latest published price is the one starting 09:00 (it ends 09:30, public 10:30).
+    Flag it as interpolated: the feature must fall back to 08:30, and the D-2 lag
+    for that clock time must go missing."""
+    filled = "2024-03-19 09:00"
+    f = _build(tmp_path, "2024-03-01", "2024-03-22", interpolated=[filled])
+    day = f[f["settlement_date"] == pd.Timestamp("2024-03-20")]
+    latest = pd.Timestamp("2024-03-19 08:30", tz="UTC")
+    assert (_decode(day["f_last_known_price"]) == latest).all()
+    d2 = f[f["settlement_date"] == pd.Timestamp("2024-03-21")]
+    at_0900 = d2[d2["target_time"] == pd.Timestamp("2024-03-21 09:00", tz="UTC")]
+    assert len(at_0900) == 1
+    assert at_0900["f_price_d2_same_time"].isna().all()
+
+
 def test_wind_error_and_bias(spring):
     f = spring[spring["settlement_date"] >= pd.Timestamp("2024-03-10")]
     assert f["f_wind_err_d2"].round(9).eq(0.1).all()
@@ -197,3 +218,4 @@ def test_register_rejects_outturn_columns(spring):
 def test_register_rejects_wrong_row_count(spring):
     with pytest.raises(ValueError, match="rows"):
         check_feature_frame(spring, len(spring) + 1)
+        
