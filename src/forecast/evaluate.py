@@ -18,6 +18,10 @@ import pandas as pd
 BASELINES = {
     "baseline_d2": "f_price_d2_same_time",  # "yesterday" as known at 11:00 on D-1
     "baseline_d7": "f_price_d7_same_time",  # same weekday, previous seven days back
+    # Average of the same half hour over D-8..D-2. Averaging removes much of one
+    # day's noise, so this is usually the hardest of the three naive forecasts to
+    # beat, and quoting skill against the weakest one would flatter the model.
+    "baseline_7d_mean": "f_price_7d_same_time_mean",
 }
 
 
