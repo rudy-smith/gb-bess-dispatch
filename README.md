@@ -8,7 +8,7 @@ solved schedule against an independent replay engine that shares no code with th
 
 Supporting it is a full data pipeline: GB settlement-period handling across clock changes,
 detection of liquidity-defaulted prices against the BSC rulebook, daily optimisation with the
-HiGHS solver, and a 130-test suite covering constraints and analytically checkable cases.
+HiGHS solver, and a 167-test suite covering constraints and analytically checkable cases.
 
 ## Key result
 
@@ -43,7 +43,14 @@ which is the trade-off between battery lifetime and arbitrage profit made explic
 - **Point-in-time data layer**: DuckDB views over the Parquet files and an as-of join that
   attaches to each half hour only the forecasts published before its decision time, 11:00 on
   the previous day. The build re-checks every row and counts what the join excluded
-- **130 tests** covering the calendar, cleaner, battery constraints, degenerate cases, the
+- **SQL feature layer**: 20 features (calendar, NESO forecasts, lagged prices, wind forecast
+  error), each joined on the rule that its inputs were public before the decision, with a
+  register recording why each one is known in time
+- **Look-ahead audit**: every feature recomputed independently in pandas and checked against
+  the SQL, with the margin between each input's publication and the decision reported
+- **Walk-forward price forecaster**: LightGBM point and 10/50/90 quantile forecasts, refitted
+  monthly on data available at the time, scored against three naive baselines
+- **167 tests** covering the calendar, cleaner, battery constraints, degenerate cases, the
   data clients and the audit statistics
 
 ## Results
@@ -138,6 +145,41 @@ than on volume. It is a strategy baseline, not a foresight baseline: it sees onl
 data while the optimiser sees the whole day, so the 36.4% mixes a worse decision rule with
 worse information.
 
+### Forecasting
+
+Day-ahead price forecasts for every half hour, made at 11:00 on the previous day using only
+information published by then, and scored over 18 months (July 2023 to December 2024) that
+the model never trained on. Each month's model is refitted on data up to two days before the
+month starts, the last complete day of prices available at its first decision.
+
+| Forecast | MAE, £/MWh | RMSE, £/MWh |
+|---|---|---|
+| LightGBM | 15.65 | 22.24 |
+| Same half hour, 7-day average (D-8 to D-2) | 20.23 | 29.06 |
+| Same half hour, two days earlier (D-2) | 23.88 | 35.59 |
+| Same half hour, a week earlier (D-7) | 25.23 | 36.95 |
+
+**MAE 22.7% below the strongest naive baseline (95% CI 17.4% to 27.0%)**, from a moving-block
+bootstrap over days. The comparison is against the 7-day average rather than the weaker
+two-day-old price, against which the model looks 34% better: at 11:00 on D-1, "yesterday's
+price" is two days old, and the averaged baseline is much harder to beat.
+
+Wind forecasts carry most of the improvement. Retrained without the six wind features, the
+model beats the 7-day average by 8.9% instead of 21.9% (measured before the interpolation
+fix described under Validation, which moved the headline by under a point). That is the
+physical driver of GB price variance showing up where it should.
+
+![Forecast error by hour of day](reports/figures/forecast_mae_by_hour.png)
+
+The 10/50/90 quantile forecasts are not well calibrated: the 10-90% band contains 57% of
+outcomes against 80% nominal, too narrow at both ends. Prices move further than the model
+expects. They are reported as they are and not yet used.
+
+![Quantile reliability](reports/figures/forecast_reliability.png)
+
+This is a forecast of a prompt index traded close to delivery, not of a day-ahead auction
+price, and is harder to forecast a day ahead for that reason.
+
 ### A representative day
 
 ![Price, dispatch and state of charge, 14 October 2024](reports/figures/dispatch_2024-10-14.png)
@@ -172,7 +214,7 @@ cannot cancel out and pass.
 - The parameter sweep and the direct benchmark solve agree to the pound on the shared cell
 
 ```powershell
-python -m pytest tests/ -q     # 130 passed
+python -m pytest tests/ -q     # 167 passed
 ```
 
 ### What validation caught
@@ -195,6 +237,17 @@ half hours against about 215 MW elsewhere, so the values belonged where the star
 After re-keying from the start time the jump is 194 MW against 213 MW. Which of two
 disagreeing fields to trust is a question the values can answer, and it should have been asked
 of them first.
+
+Look-ahead is prevented in three layers. Every feature join requires its inputs to have been
+published before the decision, so a wrong assumption produces a missing value rather than a
+leak. Tests give each synthetic price its own timestamp as its value, which turns "no
+look-ahead" into arithmetic, and two deliberately planted leaks confirmed the tests fail when
+they should. Finally, every feature is recomputed in pandas with no code shared with the SQL,
+and the two must agree; they do on all 20 features across 35,088 half hours, with the smallest
+margin between publication and decision reported for each. The audit closed one real leak
+route: the price cleaner fills short gaps by interpolating between neighbours, so a filled
+price depends on the next one, which may not yet be public. Filled prices are no longer used
+as feature sources.
 
 ## Data
 
@@ -242,6 +295,9 @@ python -m scripts.audit_wind_block                                    # 2023 for
 
 python -m scripts.build_forecast_tables    # canonical NESO forecast tables
 python -m scripts.build_point_in_time      # forecasts as known at each decision
+python -m scripts.build_features           # 20 features in SQL
+python -m scripts.audit_lookahead          # independent recomputation and timing
+python -m scripts.run_forecast             # walk-forward forecasts and scores (about 1 min)
 ```
 
 The wind audit also needs the NESO archive cached at `data/raw/neso/wind_da.parquet`.
@@ -259,13 +315,18 @@ src/prep/forecast_tables.py  canonical forecast tables, demand outturn kept sepa
 src/prep/decisions.py     decision time for every delivery half hour
 src/db/duck.py            DuckDB views over the Parquet files, query helpers
 sql/point_in_time.sql     as-of join of forecasts onto decisions
+sql/features.sql          feature frame, availability enforced in every join
+src/prep/features.py      feature register: source and availability rule per feature
+src/prep/feature_audit.py independent recomputation and timing of every feature
+src/forecast/walkforward.py  monthly walk-forward LightGBM, point and quantile
+src/forecast/evaluate.py  baselines, MAE/RMSE, pinball loss, calibration, bootstrap
 src/prep/calendar_gb.py   settlement-period calendar, 46/48/50-period days
 src/prep/clean.py         cleaning policy, liquidity-default rule, quality reporting
 src/model/battery.py      physical specification and independent simulator
 src/model/milp.py         MILP formulation and solve
 src/model/baselines.py    trailing-percentile threshold rule
 scripts/                  command-line entry points
-tests/                    130 tests
+tests/                    167 tests
 docs/model.md             formulation, design decisions, cleaning policy
 ```
 
@@ -284,7 +345,16 @@ on it would look better than it could have been. A seasonal-control test ruled o
 regeneration (block error 0.93 times its 2022 and 2024 peers, 95% CI 0.73 to 1.16) but was
 too weak to confirm the block genuine, and the block's error does not grow across the day as
 a day-ahead forecast's should. It is kept and flagged, and the forecast-driven result will be
-reported with and without it. Details in [`docs/model.md`](docs/model.md).
+reported with and without it. The price forecast adds a second, independent check: a
+forecast built on hindsight wind data would make those days look better than the same
+window a year later. They look worse: the model beats the best baseline by 15.0% on the
+block against 30.8% on June to October 2024, and wind features add about 3 points on the
+block against about 16 in 2024. Part of that gap is less training history in 2023, which
+pushes the same way and cannot hide contamination. Details in [`docs/model.md`](docs/model.md).
+
+**The quantile forecasts are too narrow.** The 10-90% band covers 57% of outcomes. The fix
+planned, before quantiles are used for dispatch, is to widen them by the size of past
+out-of-sample errors, using only earlier months.
 
 **NESO's wind forecast and Elexon's wind outturn disagree by about 1 GW on average**, with the
 sign changing between years. That points to a difference in which wind farms each covers, or
@@ -326,7 +396,10 @@ is still positive.
   Market Index Data excludes the day-ahead auction by rule, so this is a prompt reference price
   and not a price anyone can transact at
 - Wholesale arbitrage only, with no frequency response, Balancing Mechanism or Capacity Market
-- Perfect foresight only; no forecast-driven strategy yet
+- The dispatch results are perfect foresight only; the forecasts exist but the rolling
+  forecast-driven backtest does not yet
+- No gas price or bank-holiday features; gas sets the price level most of the time and is the
+  most valuable missing input
 - Degradation is throughput-based, with no depth-of-discharge weighting, rainflow counting,
   calendar ageing or temperature coupling
 - No network constraints, outages or derating; single asset, single connection point
@@ -337,10 +410,9 @@ is still positive.
 
 ## Next
 
-Day-ahead price forecasting under strict information sets, rolling-horizon optimisation
-against forecasts, settlement against outturn with imbalance exposure, and attribution of the
-resulting foresight gap. The revenue-capture percentage this project is built to measure does
-not exist yet.
+Rolling-horizon optimisation against the forecasts, settlement against outturn prices with
+imbalance exposure, and attribution of the resulting foresight gap. The revenue-capture
+percentage this project is built to measure does not exist yet.
 
 ## Development
 

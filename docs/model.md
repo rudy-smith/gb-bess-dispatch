@@ -546,3 +546,128 @@ forecast that did not exist at the decision time.
 Demand is published at least 13.25 hours before the delivery day starts, which is 10:45
 London time, so the 11:00 decision has 15 minutes to spare. A decision before 10:45 would lose
 the demand forecast entirely on the conservative reading of its timestamp.
+
+## Features
+
+`sql/features.sql` builds one row per delivery half hour with 20 features, all computable at
+that half hour's decision time. `src/prep/features.py` is the register: every feature is
+listed with its source and the reason it is known in time, and a feature frame containing an
+unregistered column, or any outturn column, is refused.
+
+| Group | Features |
+|---|---|
+| Calendar | settlement period, local minute of day, day of week, weekend, month |
+| NESO forecasts | wind MW, wind share of capacity, demand, residual demand (demand minus wind) |
+| Prices | same local time on D-2 and D-7; D-2 mean and high-low spread; mean, standard deviation and same-time mean over D-8 to D-2; latest published price |
+| Wind forecast error | D-2 mean error as a share of capacity, its trailing 28-day mean, and the difference |
+
+**Availability is enforced in the joins.** Every price and metered-output row carries the
+instant it became public: the end of its half hour plus a one-hour publication lag, deliberately
+generous since Elexon publishes within minutes. Every lag join requires that instant to precede
+the decision. A lag set too long therefore makes features missing; it cannot make them leak.
+One consequence is worth stating: "yesterday's price" is the D-2 price, because at 11:00 on D-1
+most of D-1 has not happened.
+
+**Lags follow the local clock.** Price shape follows human activity, so "the same half hour
+two days earlier" means the same local clock time, not 48 hours earlier in UTC, which differs
+by an hour across a clock change. On the autumn day with a repeated hour, only the first pass
+is used as a source, so a lag join cannot duplicate rows.
+
+**Wind error is de-meaned.** NESO's forecast and Elexon's outturn cover slightly different
+fleets, leaving a bias of order 1 GW whose sign changes between years. The D-2 error has its
+own trailing 28-day mean subtracted, using past data only.
+
+**Interpolated prices are never sources.** The cleaner fills gaps of up to an hour by
+interpolating between neighbours, so a filled value at t depends on the observed price at t+1.
+For the D-2 and D-7 lags t+1 is long past, but for the latest published price it may not be.
+Filled prices are excluded from every feature source.
+
+Not included: demand forecast error, because the publication time of NESO's demand outturn is
+unknown and cannot be shown to precede the decision; gas prices and bank holidays, which are
+not sourced yet.
+
+## Look-ahead audit
+
+Three layers, each independent of the others.
+
+1. **Structural.** Availability is a condition of every join, as above.
+2. **Arithmetic tests.** In `tests/test_features.py` each synthetic price equals its own start
+   time in hours, so a feature's value identifies exactly which half hour it came from, and the
+   test checks that half hour was public before the decision. Two leaks were planted in the SQL
+   to confirm the tests catch them: a D-1 lag without the availability condition failed five
+   tests, and a latest-price join shifted two hours late failed one.
+3. **Independent recomputation.** `src/prep/feature_audit.py` rebuilds every price and
+   wind-error feature in pandas, sharing no code with the SQL. Local keys come from pandas'
+   timezone conversion rather than the calendar table, the latest price from `merge_asof`
+   rather than DuckDB's as-of join, and windows are filtered day by day rather than joined.
+   The two must agree to 1e-9, and for every feature the audit reports the smallest margin
+   between its inputs' publication and the decision.
+
+On the full frame, all 20 features agree on all 35,088 half hours. Smallest margins:
+
+| Feature | Margin | Why |
+|---|---|---|
+| Latest published price | 0.50 h | the freshest price allowed |
+| Demand forecast | 0.25 h | published 10:45 |
+| Wind forecast | 0.67 h | latest publication in the archive |
+| D-2 prices and wind error | 9.00 h | D-2 ends at midnight, plus the lag; 9 rather than 10 on the spring clock change |
+| D-7 price | 129 h | |
+
+## Price forecasting
+
+**Target and horizon.** The price of every half hour of day D, forecast at 11:00 on D-1.
+
+**Baselines.** Three naive forecasts: the same half hour on D-2 (the latest complete day), on
+D-7 (same weekday), and the mean of the same half hour over D-8 to D-2. The last is the
+strongest, and skill is quoted against it.
+
+**Model.** LightGBM with an L1 objective, so the point forecast targets the conditional median
+and is judged by MAE, which is what it minimises. Separate models fit the 10th, 50th and 90th
+percentiles with the pinball loss, and the three are sorted row by row so they cannot cross.
+Settings are fixed rather than tuned, since tuning inside the walk-forward would need its own
+nested validation.
+
+**Anchoring.** Trees predict values from the range they were trained on and cannot follow a
+shift in the price level, and 2023 averaged well above 2024. The model is trained on the price
+minus its trailing 7-day mean, which is known at the decision time, and the mean is added
+back. On a synthetic series whose level drops by 40 in one step, the first month after the drop
+had MAE of about 6 anchored against about 39 unanchored.
+
+**Walk-forward.** Eighteen monthly folds, July 2023 to December 2024. Each month's model is
+trained on every delivery day up to two days before the month starts: at the first decision of
+the month, 11:00 on the previous day, the latest complete day of prices is two days back.
+Refitting monthly rather than daily leaves late-month models a few weeks stale, which can only
+understate skill. Random or K-fold splits are never used; they train on days after the ones
+forecast and on neighbouring half hours whose prices are strongly correlated.
+
+**Metrics.** MAE and RMSE on rows where every compared forecast exists. No MAPE: GB prices
+cross zero, where percentage errors are dominated by the half hours that matter least.
+Confidence intervals come from a 7-day moving-block bootstrap over days, because errors on
+neighbouring days are correlated.
+
+**Results.** LightGBM MAE 15.65 £/MWh against 20.23 for the 7-day same-time mean: **22.7% lower
+(95% CI 17.4% to 27.0%)**. Against the D-2 price the improvement is 34%, which flatters the
+model because that baseline is two days stale. 2024 (MAE 13.87) forecasts better than 2023
+(19.19): later folds have more history, and 2024 prices were calmer.
+
+| Ablation, skill over 7-day mean | With | Without |
+|---|---|---|
+| Latest published price | 21.9% | 21.7% |
+| All six wind features | 21.9% | 8.9% |
+
+The ablations were run before the interpolation fix, which moved the headline from 21.9% to
+22.7%. The latest published price contributes nothing, so the model is not carrying the
+morning price forward. Wind features carry about 13 of the 22 points.
+
+**Quantiles.** Observed share of outcomes below the 10th, 50th and 90th percentile forecasts:
+23.9%, 54.4% and 81.3%. The 10-90% band contains 57.4% of outcomes against 80% nominal. The
+intervals are too narrow at both ends. They are not used for dispatch until they are widened
+by the size of past out-of-sample errors, using earlier months only.
+
+**The 2023 wind block, again.** If the late-stamped 2023 wind forecasts had been rebuilt with
+hindsight, the model would do conspicuously well on those days. It does worse: 15.0% over the
+best baseline on the 96 block days in the test period against 30.8% on June to October 2024,
+and the wind features add about 3 points on the block against about 16 a year later. The 2023
+folds had less training history, which lowers skill in the same direction and so cannot hide
+contamination. With the seasonal-control test, this is the second independent piece of
+evidence that the block is genuine.
