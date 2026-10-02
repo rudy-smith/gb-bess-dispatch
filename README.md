@@ -1,34 +1,79 @@
-# GB Grid-Scale Battery Arbitrage Optimiser
+# GB Battery Storage: Price Forecasting and Dispatch Backtest
 
-Built a dispatch optimiser for a modelled **1 MW / 2 MWh grid-scale battery** using two years
-of half-hourly **Elexon Market Index Data (2023-2024)**. The project formulates dispatch as a
-mixed-integer linear programme (MILP) that maximises wholesale electricity arbitrage revenue
-subject to state-of-charge, power and round-trip efficiency constraints, then validates every
-solved schedule against an independent replay engine that shares no code with the solver.
+How much of a GB battery's wholesale arbitrage revenue can be captured using only what was
+known the day before? This project models a **1 MW / 2 MWh lithium-ion battery** trading
+half-hourly GB power prices over **2023 and 2024**, first with perfect hindsight to set the
+ceiling, then with day-ahead price forecasts built only from data published before each
+decision, settled at the prices that actually occurred.
 
-Supporting it is a full data pipeline: GB settlement-period handling across clock changes,
-detection of liquidity-defaulted prices against the BSC rulebook, daily optimisation with the
-HiGHS solver, and a 183-test suite covering constraints and analytically checkable cases.
+It is a modelling and backtesting project on public Elexon and NESO data, not a trading
+record. The figures below estimate what information is worth, not executable trading returns:
+prices are a prompt market index, not a day-ahead auction price anyone transacts at.
 
-## Key result
+![Cumulative revenue, forecast-driven against perfect foresight](reports/figures/backtest_cumulative.png)
 
-**£50,248 to £50,456 per MW per year**, the perfect-foresight wholesale arbitrage benchmark for
-a GB battery at **90% round-trip efficiency** across **728 daily MILP solves**. The range
-reflects two treatments of three excluded settlement days, worth 0.41% of annual revenue.
+## Summary
 
-This is an upper bound, not an expected return. Capturing it requires 872 equivalent full
-cycles a year, roughly twice what a real asset sustains. Adding a degradation cost of
-**£10/MWh of throughput** reduces cycling by **31.8%** for a revenue reduction of **4.9%**,
-which is the trade-off between battery lifetime and arbitrage profit made explicit.
+| Question | Answer |
+|---|---|
+| What could the battery earn from wholesale arbitrage with perfect hindsight? | **£50,248 to £50,456 per MW per year**, the full-sample upper bound over 728 usable days in 2023–24. The optimiser reaches it while cycling 872 times a year |
+| How much of that does a forecast made at 11:00 the day before capture? | **63.3% (95% CI 60.2 to 66.1)** on a matched set of 532 out-of-sample days from July 2023, where perfect foresight earns £46,590/MW/yr. The forecast earns £29,487 against £26,799 for a naive forecast (the same half hour averaged over the previous week), which captures **57.5%**: **+5.8 points (paired 95% CI 3.8 to 7.8)**, or £2,688/MW/yr, while cycling 9% less |
+| How good is the price forecast? | Mean absolute error **22.7% below the strongest naive baseline (95% CI 17.4 to 27.0)** over 18 out-of-sample months; NESO wind forecasts carry most of the gain |
+| What does protecting the cells cost? | Pricing degradation at **£10/MWh of throughput cuts cycling 31.8% for 4.9% less revenue** |
 
-**Forecast-driven: 63.3% of perfect foresight (95% CI 60.2% to 66.1%).** Dispatching on
-day-ahead price forecasts made at 11:00 the day before, and settling every half hour at the
-actual price, earns £29,487/MW/yr against £46,590 for perfect foresight on the same 532
-out-of-sample days (July 2023 to December 2024). A naive forecast, the average of the same
-half hour over the previous week, already captures 57.5%; the model adds **5.8 points
-(paired 95% CI 3.8 to 7.8)** while cycling 9% less.
+Most of the capturable value is the predictable daily shape of prices, which a one-week
+average already finds. The forecast's contribution is the margin above that, and it comes
+mostly from wind.
 
-## What I built
+**Scope.** Wholesale arbitrage only (no frequency response, Balancing Mechanism or Capacity
+Market), a price-taking asset, and a prompt index price rather than a day-ahead auction
+price. There is no imbalance cost, by construction rather than by measurement. This measures
+how much revenue the information available at 11:00 is worth; it is not an executable trading
+strategy, since nobody transacts at the index price itself. Full list under
+[Limitations](#limitations).
+
+## How it works
+
+1. **Prices.** Half-hourly Elexon Market Index Data, cleaned for clock changes, gaps and
+   prices defaulted to £0.00 by the market's liquidity rule.
+2. **Perfect-foresight benchmark.** A mixed-integer linear programme (PuLP, HiGHS) solved for
+   each day, every schedule replayed independently in pandas to 1e-6.
+3. **Fundamentals.** NESO day-ahead wind and demand forecasts, each tagged with the time it
+   was published, and Elexon wind outturn by fuel type.
+4. **Point-in-time data layer.** DuckDB/SQL as-of joins attach to each half hour only the
+   forecasts published before its decision time, 11:00 London on the previous day.
+5. **Price forecast.** 20 features built in SQL; LightGBM refitted monthly in walk-forward
+   order and scored against three naive baselines.
+6. **Backtest.** The benchmark optimiser plans each day on the forecast; every half hour is
+   settled at the actual price and compared with perfect foresight on the same days.
+
+## What validation caught
+
+- **Prices that were never traded.** 15 £0.00 prices were liquidity defaults, not market
+  clears. One affected day ranked 7th of 729. Removing them lowered the benchmark 0.42%, all
+  in one direction, because an optimiser with hindsight seeks out exactly those errors.
+- **A timestamp fault in Elexon generation data.** On 192 half hours in 2022 the settlement
+  label and the start time disagree by a day. The label was trusted first, wrongly; a
+  continuity check on wind output showed which field was right.
+- **Look-ahead.** Prevented in three independent layers (availability rules in every SQL
+  join, tests with planted leaks that fail as they should, and a separate pandas
+  recomputation of all 20 features). The audit closed one real leak: interpolated prices
+  depend on the next price, so they are no longer used as features.
+
+Details under [Validation](#validation) and in [`docs/model.md`](docs/model.md).
+
+## Where to start reading the code
+
+| File | What it shows |
+|---|---|
+| [`src/model/milp.py`](src/model/milp.py) | The dispatch optimisation |
+| [`sql/point_in_time.sql`](sql/point_in_time.sql) | The as-of join on publication time |
+| [`sql/features.sql`](sql/features.sql) | Features with availability enforced in every join |
+| [`src/backtest/forecast_dispatch.py`](src/backtest/forecast_dispatch.py) | Plan on forecasts, settle at actual prices |
+| [`src/prep/feature_audit.py`](src/prep/feature_audit.py) | Independent look-ahead audit |
+| [`docs/model.md`](docs/model.md) | Every design decision and the alternatives considered |
+
+## Components
 
 - **Elexon Insights API client**: half-hourly Market Index Data, 7-day request windows,
   cached to Parquet so re-runs cost no API calls
@@ -65,7 +110,104 @@ half hour over the previous week, already captures 57.5%; the model adds **5.8 p
 
 ## Results
 
-### Benchmark
+### Forecast-driven dispatch
+
+For each delivery day, the same MILP as the benchmark plans the day at 11:00 on the previous
+day from forecast prices. The battery delivers that plan exactly and every half hour is
+settled at the actual price. Perfect foresight plans the same day on the actual prices and
+is settled the same way. Battery, constraints, day-boundary state of charge and settlement
+price are identical, so the gap is the cost of the information alone. All strategies are
+scored on one matched set of 532 days; 18 are dropped because a naive forecast is undefined
+on them (mostly in the week after the unusable days of 23-24 August 2023).
+
+| Strategy | £/MW/yr | Share of perfect foresight | Cycles/yr | Loss-making days |
+|---|---|---|---|---|
+| Perfect foresight | 46,590 | 100% | 859 | 0 |
+| LightGBM forecast | 29,487 | **63.3%** (60.2 to 66.1) | 662 | 19 |
+| Same half hour, 7-day average | 26,799 | 57.5% (54.3 to 60.3) | 724 | 36 |
+| Same half hour, a week earlier | 16,895 | 36.3% (32.2 to 40.2) | 863 | 106 |
+| Same half hour, two days earlier | 15,241 | 32.7% (28.3 to 36.6) | 861 | 110 |
+
+Intervals are from a 7-day moving-block bootstrap over days. The model's gain over the
+7-day average is **5.8 points, paired 95% CI 3.8 to 7.8**, resampling both strategies on the
+same days, since separate intervals ignore that a volatile week helps both.
+
+What the table says:
+
+- **Most of what is capturable comes from the predictable daily shape.** A one-week average
+  already captures 57.5%. The model's contribution is the extra 5.8 points,
+  £2,688/MW/yr (£29,487 against £26,799).
+- **The model earns more while cycling less.** It trades only where the forecast spread
+  covers the round-trip loss, so it cycles less than the naive average and far less than
+  perfect foresight.
+- **Stale single-day profiles trade on noise.** The two-day and one-week-old profiles cycle
+  as hard as perfect foresight and capture about a third of the revenue, losing money on
+  roughly one day in five.
+- **Capture rose from 55.9% in July to December 2023 to 67.9% in 2024**, as the model had
+  more history and prices were calmer.
+
+**Cross-check.** Perfect foresight in 2024 here is £42,093/MW/yr against £42,312 in the
+benchmark: the same optimiser on the same prices, differing only by the dropped days.
+
+**The 2023 wind block.** Excluding the 87 days whose wind forecasts have suspect publication
+times raises capture to 66.4% and the gain over the naive forecast to 7.1 points. If the
+block had been built with hindsight, removing it would lower capture, not raise it.
+
+**No imbalance cost, by construction.** The schedule is traded at each half hour's index
+price and delivered exactly by a fully controllable battery, so there is no deviation to
+settle. That would change against a separate day-ahead auction price, which is a limitation
+of the price series, not a zero that was measured.
+
+### Forecasting
+
+Day-ahead price forecasts for every half hour, made at 11:00 on the previous day using only
+information published by then, and scored over 18 months (July 2023 to December 2024) that
+the model never trained on. Each month's model is refitted on data up to two days before the
+month starts, the last complete day of prices available at its first decision.
+
+| Forecast | MAE, £/MWh | RMSE, £/MWh |
+|---|---|---|
+| LightGBM | 15.65 | 22.24 |
+| Same half hour, 7-day average (D-8 to D-2) | 20.23 | 29.06 |
+| Same half hour, two days earlier (D-2) | 23.88 | 35.59 |
+| Same half hour, a week earlier (D-7) | 25.23 | 36.95 |
+
+**MAE 22.7% below the strongest naive baseline (95% CI 17.4% to 27.0%)**, from a moving-block
+bootstrap over days. The comparison is against the 7-day average rather than the weaker
+two-day-old price, against which the model looks 34% better: at 11:00 on D-1, "yesterday's
+price" is two days old, and the averaged baseline is much harder to beat.
+
+Wind forecasts carry most of the improvement. Retrained without the six wind features, the
+model beats the 7-day average by 8.9% instead of 21.9% (measured before the interpolation
+fix described under Validation, which moved the headline by under a point). That is the
+physical driver of GB price variance showing up where it should.
+
+![Forecast error by hour of day](reports/figures/forecast_mae_by_hour.png)
+
+The 10/50/90 quantile forecasts are not well calibrated: the 10-90% band contains 57% of
+outcomes against 80% nominal, too narrow at both ends. Prices move further than the model
+expects. They are reported as they are and not yet used.
+
+![Quantile reliability](reports/figures/forecast_reliability.png)
+
+This is a forecast of a prompt index traded close to delivery, not of a day-ahead auction
+price, and is harder to forecast a day ahead for that reason.
+
+### Perfect-foresight benchmark
+
+**£50,248 to £50,456 per MW per year** at **90% round-trip efficiency** across **728 daily
+MILP solves**. The range reflects two treatments of three excluded settlement days, worth
+0.41% of annual revenue.
+
+This is an upper bound, not an expected return. The optimiser earns it while cycling 872
+equivalent full cycles a year, because with no wear cost any spread that covers the round-trip
+loss is worth trading. It does not need that much cycling: with a £10/MWh wear charge it keeps
+95% of the revenue at 595 cycles (see Degradation).
+
+The forecast-driven comparison below uses a matched subset of 532 days from July 2023, where
+perfect foresight earns £46,590/MW/yr rather than the full-sample £50,456, because the subset
+leaves out the first half of 2023 and is mostly 2024, the lower-value year. Every capture rate
+is a share of that matched figure.
 
 | Period | Revenue | Equivalent full cycles |
 |---|---|---|
@@ -154,91 +296,6 @@ The rule trades less and still captures far less, so it is losing on period sele
 than on volume. It is a strategy baseline, not a foresight baseline: it sees only trailing
 data while the optimiser sees the whole day, so the 36.4% mixes a worse decision rule with
 worse information.
-
-### Forecasting
-
-Day-ahead price forecasts for every half hour, made at 11:00 on the previous day using only
-information published by then, and scored over 18 months (July 2023 to December 2024) that
-the model never trained on. Each month's model is refitted on data up to two days before the
-month starts, the last complete day of prices available at its first decision.
-
-| Forecast | MAE, £/MWh | RMSE, £/MWh |
-|---|---|---|
-| LightGBM | 15.65 | 22.24 |
-| Same half hour, 7-day average (D-8 to D-2) | 20.23 | 29.06 |
-| Same half hour, two days earlier (D-2) | 23.88 | 35.59 |
-| Same half hour, a week earlier (D-7) | 25.23 | 36.95 |
-
-**MAE 22.7% below the strongest naive baseline (95% CI 17.4% to 27.0%)**, from a moving-block
-bootstrap over days. The comparison is against the 7-day average rather than the weaker
-two-day-old price, against which the model looks 34% better: at 11:00 on D-1, "yesterday's
-price" is two days old, and the averaged baseline is much harder to beat.
-
-Wind forecasts carry most of the improvement. Retrained without the six wind features, the
-model beats the 7-day average by 8.9% instead of 21.9% (measured before the interpolation
-fix described under Validation, which moved the headline by under a point). That is the
-physical driver of GB price variance showing up where it should.
-
-![Forecast error by hour of day](reports/figures/forecast_mae_by_hour.png)
-
-The 10/50/90 quantile forecasts are not well calibrated: the 10-90% band contains 57% of
-outcomes against 80% nominal, too narrow at both ends. Prices move further than the model
-expects. They are reported as they are and not yet used.
-
-![Quantile reliability](reports/figures/forecast_reliability.png)
-
-This is a forecast of a prompt index traded close to delivery, not of a day-ahead auction
-price, and is harder to forecast a day ahead for that reason.
-
-### Forecast-driven dispatch
-
-For each delivery day, the same MILP as the benchmark plans the day at 11:00 on the previous
-day from forecast prices. The battery delivers that plan exactly and every half hour is
-settled at the actual price. Perfect foresight plans the same day on the actual prices and
-is settled the same way. Battery, constraints, day-boundary state of charge and settlement
-price are identical, so the gap is the cost of the information alone. All strategies are
-scored on one matched set of 532 days; 18 are dropped because a naive forecast is undefined
-on them (mostly in the week after the unusable days of 23-24 August 2023).
-
-| Strategy | £/MW/yr | Share of perfect foresight | Cycles/yr | Loss-making days |
-|---|---|---|---|---|
-| Perfect foresight | 46,590 | 100% | 859 | 0 |
-| LightGBM forecast | 29,487 | **63.3%** (60.2 to 66.1) | 662 | 19 |
-| Same half hour, 7-day average | 26,799 | 57.5% (54.3 to 60.3) | 724 | 36 |
-| Same half hour, a week earlier | 16,895 | 36.3% (32.2 to 40.2) | 863 | 106 |
-| Same half hour, two days earlier | 15,241 | 32.7% (28.3 to 36.6) | 861 | 110 |
-
-Intervals are from a 7-day moving-block bootstrap over days. The model's gain over the
-7-day average is **5.8 points, paired 95% CI 3.8 to 7.8**, resampling both strategies on the
-same days, since separate intervals ignore that a volatile week helps both.
-
-What the table says:
-
-- **Most of what is capturable comes from the predictable daily shape.** A one-week average
-  already captures 57.5%. The model's contribution is the extra 5.8 points, about
-  £2,700/MW/yr.
-- **The model earns more while cycling less.** It trades only where the forecast spread
-  covers the round-trip loss, so it cycles less than the naive average and far less than
-  perfect foresight.
-- **Stale single-day profiles trade on noise.** The two-day and one-week-old profiles cycle
-  as hard as perfect foresight and capture about a third of the revenue, losing money on
-  roughly one day in five.
-- **Capture rose from 55.9% in July to December 2023 to 67.9% in 2024**, as the model had
-  more history and prices were calmer.
-
-![Cumulative revenue, forecast-driven against perfect foresight](reports/figures/backtest_cumulative.png)
-
-**Cross-check.** Perfect foresight in 2024 here is £42,093/MW/yr against £42,312 in the
-benchmark: the same optimiser on the same prices, differing only by the dropped days.
-
-**The 2023 wind block.** Excluding the 87 days whose wind forecasts have suspect publication
-times raises capture to 66.4% and the gain over the naive forecast to 7.1 points. If the
-block had been built with hindsight, removing it would lower capture, not raise it.
-
-**No imbalance cost, by construction.** The schedule is traded at each half hour's index
-price and delivered exactly by a fully controllable battery, so there is no deviation to
-settle. That would change against a separate day-ahead auction price, which is a limitation
-of the price series, not a zero that was measured.
 
 ### A representative day
 
@@ -421,8 +478,9 @@ out-of-sample errors, using only earlier months.
 
 **NESO's wind forecast and Elexon's wind outturn disagree by about 1 GW on average**, with the
 sign changing between years. That points to a difference in which wind farms each covers, or
-in curtailment treatment, rather than forecast error, and will be removed from error features
-using past data only.
+in curtailment treatment, rather than forecast error. The wind error feature has its trailing
+28-day mean subtracted, using past data only, so the offset does not reach the forecast; its
+cause is not confirmed.
 
 **No external benchmark comparison yet.** The obvious sanity check is against published GB
 fleet revenues, and it has not been done. It needs care: published figures cover the full
@@ -480,9 +538,15 @@ is still positive.
 Attribution of the 37-point gap between forecast-driven and perfect-foresight revenue:
 which properties of the forecast cost money (level, spread or timing), which half hours the
 revenue was lost in, and what the midnight state-of-charge reset costs the benchmark itself.
-Then frequency-response stacking, rainflow cycle counting and a written report.
+Then a gas price feature, frequency-response stacking, rainflow cycle counting and a written
+report.
 
 ## Development
 
 Built with substantial use of an LLM as a pair programmer. The modelling decisions, validation
 design and result interrogation are documented in `docs/model.md` and in the commit history.
+
+## Author
+
+Rudy Smith, MEng General Engineering (Electrical), University of Sheffield.
+[LinkedIn](https://www.linkedin.com/in/rudy-smith9/)
