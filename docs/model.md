@@ -671,3 +671,73 @@ and the wind features add about 3 points on the block against about 16 a year la
 folds had less training history, which lowers skill in the same direction and so cannot hide
 contamination. With the seasonal-control test, this is the second independent piece of
 evidence that the block is genuine.
+
+## Forecast-driven dispatch
+
+**Protocol.** For each delivery day D in the out-of-sample forecast period:
+
+1. At 11:00 on D-1 the MILP is solved on the forecast price of every half hour of D, with
+   the same battery, constraints and 50% opening and closing state of charge as the
+   benchmark.
+2. The battery delivers that schedule exactly. It is fully controllable and the schedule is
+   feasible by construction.
+3. Each half hour is settled at the actual price: revenue is the sum of actual price times
+   (export minus import), less degradation on throughput, computed by the same independent
+   replay that audits the benchmark.
+
+Perfect foresight solves the same day on actual prices and is settled the same way. Capture
+is a ratio of sums over days, not a mean of daily ratios, so a day with tiny perfect-foresight
+revenue cannot dominate it.
+
+**Matched days.** A day is scored only if it is usable for the benchmark and every strategy
+has a forecast for every half hour. 532 of 550 out-of-sample days qualify. The 18 dropped are
+days on which a naive forecast is undefined, mostly within a week of the liquidity-defaulted
+days of 23-24 August 2023.
+
+**The invariant.** Settled at actual prices, no schedule can earn more than perfect
+foresight, which is the optimum over all feasible schedules for those prices. Every day is
+checked and the run stops on a violation. The most dangerous bug in a backtest of this kind
+is settling at the forecast instead of the actual price, which makes every strategy look
+excellent. The tests catch it from several directions: a perfect forecast must capture
+exactly 100%; a forecast that doubles every price must also capture exactly 100%, because
+scaling prices does not change the optimal schedule (settled at the forecast it would show
+200%); a flat forecast must not trade; a negated forecast must lose money. With the bug
+planted, 11 of the 15 backtest tests failed.
+
+**Rolling.** The horizon rolls one delivery day at a time. Within a day there is no
+re-optimisation, because the forecasts are a single day-ahead vintage and nothing new
+arrives to re-optimise on.
+
+**Imbalance.** None, by construction: each half hour is traded at the index price it is
+settled at and delivered exactly. It would arise against a separate day-ahead auction price.
+
+**Results**, 1 MW / 2 MWh, 90% round trip, zero degradation cost, 532 days:
+
+| Strategy | £/MW/yr | Capture | 95% CI | Cycles/yr |
+|---|---|---|---|---|
+| Perfect foresight | 46,590 | 100% | | 859 |
+| LightGBM forecast | 29,487 | 63.3% | 60.2 to 66.1 | 662 |
+| 7-day same-time mean | 26,799 | 57.5% | 54.3 to 60.3 | 724 |
+| D-7 same time | 16,895 | 36.3% | 32.2 to 40.2 | 863 |
+| D-2 same time | 15,241 | 32.7% | 28.3 to 36.6 | 861 |
+
+LightGBM minus the 7-day mean: 5.8 points, paired 95% CI 3.8 to 7.8, from a moving-block
+bootstrap that resamples both strategies on the same days. Two separate intervals overlap,
+but that does not bound the difference, because the strategies share days and a volatile
+spell helps both.
+
+By period: July to December 2023, 55.9% against 53.6% for the 7-day mean; 2024, 67.9%
+against 60.0%. Perfect foresight in 2024 is £42,093/MW/yr against £42,312 in the benchmark,
+the difference being the dropped days, which cross-checks the day matching and annualisation.
+
+Excluding the 87 days with suspect wind publication times: capture 66.4% (63.7 to 69.0),
+gain over the 7-day mean 7.1 points (5.1 to 9.1). The block lowers capture rather than
+raising it, the third independent indication that it was not built with hindsight.
+
+**Reading the result.** A one-week average of each half hour already captures most of what
+is available, because the daily shape of GB prices, cheap overnight and dear in the evening,
+is predictable. Forecasting skill shows in the remaining margin. The model also cycles 9%
+less than the naive average: it trades only when the forecast spread covers the round-trip
+loss, where a stale profile asks for a full cycle every day whether or not the spread is
+real. The single-day naive profiles show that failure clearly, cycling as hard as perfect
+foresight for a third of its revenue.

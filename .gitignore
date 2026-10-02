@@ -18,6 +18,7 @@ reports/quality/*
 !reports/figures/sensitivity_duration_efficiency.png
 !reports/figures/forecast_mae_by_hour.png
 !reports/figures/forecast_reliability.png
+!reports/figures/backtest_cumulative.png
  
 # --- python ---
 __pycache__/
@@ -44,4 +45,3 @@ secrets.yaml
 .idea/
 .DS_Store
 Thumbs.db
- 

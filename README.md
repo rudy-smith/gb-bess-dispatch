@@ -8,7 +8,7 @@ solved schedule against an independent replay engine that shares no code with th
 
 Supporting it is a full data pipeline: GB settlement-period handling across clock changes,
 detection of liquidity-defaulted prices against the BSC rulebook, daily optimisation with the
-HiGHS solver, and a 167-test suite covering constraints and analytically checkable cases.
+HiGHS solver, and a 183-test suite covering constraints and analytically checkable cases.
 
 ## Key result
 
@@ -20,6 +20,13 @@ This is an upper bound, not an expected return. Capturing it requires 872 equiva
 cycles a year, roughly twice what a real asset sustains. Adding a degradation cost of
 **£10/MWh of throughput** reduces cycling by **31.8%** for a revenue reduction of **4.9%**,
 which is the trade-off between battery lifetime and arbitrage profit made explicit.
+
+**Forecast-driven: 63.3% of perfect foresight (95% CI 60.2% to 66.1%).** Dispatching on
+day-ahead price forecasts made at 11:00 the day before, and settling every half hour at the
+actual price, earns £29,487/MW/yr against £46,590 for perfect foresight on the same 532
+out-of-sample days (July 2023 to December 2024). A naive forecast, the average of the same
+half hour over the previous week, already captures 57.5%; the model adds **5.8 points
+(paired 95% CI 3.8 to 7.8)** while cycling 9% less.
 
 ## What I built
 
@@ -50,7 +57,10 @@ which is the trade-off between battery lifetime and arbitrage profit made explic
   the SQL, with the margin between each input's publication and the decision reported
 - **Walk-forward price forecaster**: LightGBM point and 10/50/90 quantile forecasts, refitted
   monthly on data available at the time, scored against three naive baselines
-- **167 tests** covering the calendar, cleaner, battery constraints, degenerate cases, the
+- **Forecast-driven backtest**: the benchmark optimiser run on forecasts instead of actual
+  prices, every schedule settled at actual prices, with a check on every day that no schedule
+  beats perfect foresight
+- **183 tests** covering the calendar, cleaner, battery constraints, degenerate cases, the
   data clients and the audit statistics
 
 ## Results
@@ -180,6 +190,56 @@ expects. They are reported as they are and not yet used.
 This is a forecast of a prompt index traded close to delivery, not of a day-ahead auction
 price, and is harder to forecast a day ahead for that reason.
 
+### Forecast-driven dispatch
+
+For each delivery day, the same MILP as the benchmark plans the day at 11:00 on the previous
+day from forecast prices. The battery delivers that plan exactly and every half hour is
+settled at the actual price. Perfect foresight plans the same day on the actual prices and
+is settled the same way. Battery, constraints, day-boundary state of charge and settlement
+price are identical, so the gap is the cost of the information alone. All strategies are
+scored on one matched set of 532 days; 18 are dropped because a naive forecast is undefined
+on them (mostly in the week after the unusable days of 23-24 August 2023).
+
+| Strategy | £/MW/yr | Share of perfect foresight | Cycles/yr | Loss-making days |
+|---|---|---|---|---|
+| Perfect foresight | 46,590 | 100% | 859 | 0 |
+| LightGBM forecast | 29,487 | **63.3%** (60.2 to 66.1) | 662 | 19 |
+| Same half hour, 7-day average | 26,799 | 57.5% (54.3 to 60.3) | 724 | 36 |
+| Same half hour, a week earlier | 16,895 | 36.3% (32.2 to 40.2) | 863 | 106 |
+| Same half hour, two days earlier | 15,241 | 32.7% (28.3 to 36.6) | 861 | 110 |
+
+Intervals are from a 7-day moving-block bootstrap over days. The model's gain over the
+7-day average is **5.8 points, paired 95% CI 3.8 to 7.8**, resampling both strategies on the
+same days, since separate intervals ignore that a volatile week helps both.
+
+What the table says:
+
+- **Most of what is capturable comes from the predictable daily shape.** A one-week average
+  already captures 57.5%. The model's contribution is the extra 5.8 points, about
+  £2,700/MW/yr.
+- **The model earns more while cycling less.** It trades only where the forecast spread
+  covers the round-trip loss, so it cycles less than the naive average and far less than
+  perfect foresight.
+- **Stale single-day profiles trade on noise.** The two-day and one-week-old profiles cycle
+  as hard as perfect foresight and capture about a third of the revenue, losing money on
+  roughly one day in five.
+- **Capture rose from 55.9% in July to December 2023 to 67.9% in 2024**, as the model had
+  more history and prices were calmer.
+
+![Cumulative revenue, forecast-driven against perfect foresight](reports/figures/backtest_cumulative.png)
+
+**Cross-check.** Perfect foresight in 2024 here is £42,093/MW/yr against £42,312 in the
+benchmark: the same optimiser on the same prices, differing only by the dropped days.
+
+**The 2023 wind block.** Excluding the 87 days whose wind forecasts have suspect publication
+times raises capture to 66.4% and the gain over the naive forecast to 7.1 points. If the
+block had been built with hindsight, removing it would lower capture, not raise it.
+
+**No imbalance cost, by construction.** The schedule is traded at each half hour's index
+price and delivered exactly by a fully controllable battery, so there is no deviation to
+settle. That would change against a separate day-ahead auction price, which is a limitation
+of the price series, not a zero that was measured.
+
 ### A representative day
 
 ![Price, dispatch and state of charge, 14 October 2024](reports/figures/dispatch_2024-10-14.png)
@@ -214,7 +274,7 @@ cannot cancel out and pass.
 - The parameter sweep and the direct benchmark solve agree to the pound on the shared cell
 
 ```powershell
-python -m pytest tests/ -q     # 167 passed
+python -m pytest tests/ -q     # 183 passed
 ```
 
 ### What validation caught
@@ -298,6 +358,7 @@ python -m scripts.build_point_in_time      # forecasts as known at each decision
 python -m scripts.build_features           # 20 features in SQL
 python -m scripts.audit_lookahead          # independent recomputation and timing
 python -m scripts.run_forecast             # walk-forward forecasts and scores (about 1 min)
+python -m scripts.run_forecast_backtest    # forecast-driven dispatch (about 2 min)
 ```
 
 The wind audit also needs the NESO archive cached at `data/raw/neso/wind_da.parquet`.
@@ -320,13 +381,14 @@ src/prep/features.py      feature register: source and availability rule per fea
 src/prep/feature_audit.py independent recomputation and timing of every feature
 src/forecast/walkforward.py  monthly walk-forward LightGBM, point and quantile
 src/forecast/evaluate.py  baselines, MAE/RMSE, pinball loss, calibration, bootstrap
+src/backtest/forecast_dispatch.py  dispatch on forecasts, settle at actual prices, capture
 src/prep/calendar_gb.py   settlement-period calendar, 46/48/50-period days
 src/prep/clean.py         cleaning policy, liquidity-default rule, quality reporting
 src/model/battery.py      physical specification and independent simulator
 src/model/milp.py         MILP formulation and solve
 src/model/baselines.py    trailing-percentile threshold rule
 scripts/                  command-line entry points
-tests/                    167 tests
+tests/                    183 tests
 docs/model.md             formulation, design decisions, cleaning policy
 ```
 
@@ -344,8 +406,9 @@ If the block was regenerated with hindsight it would be too accurate, and any fo
 on it would look better than it could have been. A seasonal-control test ruled out hindsight
 regeneration (block error 0.93 times its 2022 and 2024 peers, 95% CI 0.73 to 1.16) but was
 too weak to confirm the block genuine, and the block's error does not grow across the day as
-a day-ahead forecast's should. It is kept and flagged, and the forecast-driven result will be
-reported with and without it. The price forecast adds a second, independent check: a
+a day-ahead forecast's should. It is kept and flagged. Two further checks point the same way.
+Removing the block raises forecast-driven capture from 63.3% to 66.4% rather than lowering
+it. And the price forecast adds an independent check: a
 forecast built on hindsight wind data would make those days look better than the same
 window a year later. They look worse: the model beats the best baseline by 15.0% on the
 block against 30.8% on June to October 2024, and wind features add about 3 points on the
@@ -396,8 +459,12 @@ is still positive.
   Market Index Data excludes the day-ahead auction by rule, so this is a prompt reference price
   and not a price anyone can transact at
 - Wholesale arbitrage only, with no frequency response, Balancing Mechanism or Capacity Market
-- The dispatch results are perfect foresight only; the forecasts exist but the rolling
-  forecast-driven backtest does not yet
+- Forecasts are a single day-ahead vintage, so the schedule is fixed once per day and not
+  re-optimised within the day
+- No imbalance exposure, because trading and settlement use the same index price; a strategy
+  traded at a day-ahead auction price and delivered against the index would carry it
+- Every day still returns to 50% state of charge at midnight, in the forecast-driven
+  strategy as in the benchmark
 - No gas price or bank-holiday features; gas sets the price level most of the time and is the
   most valuable missing input
 - Degradation is throughput-based, with no depth-of-discharge weighting, rainflow counting,
@@ -410,9 +477,10 @@ is still positive.
 
 ## Next
 
-Rolling-horizon optimisation against the forecasts, settlement against outturn prices with
-imbalance exposure, and attribution of the resulting foresight gap. The revenue-capture
-percentage this project is built to measure does not exist yet.
+Attribution of the 37-point gap between forecast-driven and perfect-foresight revenue:
+which properties of the forecast cost money (level, spread or timing), which half hours the
+revenue was lost in, and what the midnight state-of-charge reset costs the benchmark itself.
+Then frequency-response stacking, rainflow cycle counting and a written report.
 
 ## Development
 
